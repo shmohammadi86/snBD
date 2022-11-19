@@ -1,0 +1,485 @@
+---
+title: "Perform DE analysis"
+subtitle: "Step 1: Compute pseudobulk (PB) profiles"
+author: "Shahin Mohammadi"
+date: "Run on `r Sys.time()`"
+documentclass: article
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r include=FALSE}
+# devtools::load_all("~/ACTIONet/")
+require(ACTIONet)
+
+tables.path = "~/BD/results/tables/"
+figures.path = "~/BD/results/figures/"
+dataset.path = "~/BD/results/datasets/"
+
+```
+
+```{r}
+storeDataset = function( obj, name, description = NULL, dataset.path = "results/datasets"){
+  file_name = paste0(name, ".rds")
+  file_path = file.path(dataset.path, file_name)
+  readr::write_rds( obj, file=file_path)
+  
+  # Syn.datasets <- synStore(Syn.datasets)
+  # folder = Syn.datasets$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }	
+  # OBJ = File(file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )	
+}
+
+storeTable = function( DFs, name, description = NULL, tables.path = "results/tables"){
+  if(is.null(names(DFs))) {
+    names(DFs) = paste("Table", 1:length(DFs), sep = "")
+  }
+  wb <- openxlsx::createWorkbook()
+  for(i in 1:length(DFs)) {
+    n = names(DFs)[[i]] 
+    openxlsx::addWorksheet(wb=wb, sheetName = n)
+    openxlsx::writeData(wb, sheet = n, DFs[[i]]) 
+  }
+  file_name = paste0(name, ".xlsx")
+  file_path = file.path(tables.path, file_name)
+  openxlsx::saveWorkbook(wb, file_path, overwrite = TRUE)
+  
+  # Syn.tables <- synStore(Syn.tables)
+  # folder = Syn.tables$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }
+  # OBJ = File(path = file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )	
+}
+
+
+# Store figure
+storeFigure = function( gg, name, extension, description = NULL, width = 10, height = 8, figures.path = "results/figures"){
+  if(extension == "png") {
+    file_name = paste0(name, ".png")
+    file_path = file.path(figures.path, file_name)
+    png(file_path, width = width, height = height, units = "in", res = 300)
+  } else if(extension == "pdf") {
+    file_name = paste0(name, ".pdf")
+    file_path = file.path(figures.path, file_name)
+    pdf(file_path, width = width, height = height)
+  }
+  print(gg)
+  dev.off()
+  
+  # Syn.figures <- synStore(Syn.figures)
+  # folder = Syn.figures$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }  
+  # OBJ = File(path = file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )
+}
+```
+
+
+# Setup environment
+```{r}
+# Thresholds on the FDR-corrected meta-analysis results
+pval_threshold = 0.05
+logFC_threshold = 0.1
+
+# Load pseudobulk samples
+
+cols= readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+pb.sce = readr::read_rds("~/BD_PB_new_norm.rds")
+# pb.sce = readr::read_rds("~/BD/results/datasets/BD_pseudobulk_profiles.rds")
+
+# readr::write_rds(sce, "BD_sce_new_norm.rds")
+# readr::write_rds(pb.sce, "BD_PB_new_norm.rds")
+
+```
+
+
+# Prefilter outlier samples using % of excitatory neurons
+SZ33 is removed due to having > 80% ExNeu, and samples SZ3, SZ15, SZ24, SZ29 are removed due to having less than 10% ExNeu
+```{r}
+ncells = t(do.call(rbind, pb.sce@int_colData$n_cells))
+
+cs = Matrix::colSums(ncells)
+ncells.freq = 100*scale(ncells, center = F, scale = cs)
+Ex.perc = (fast_column_sums(ncells.freq[grepl("^Ex", rownames(ncells.freq)) & !grepl("^Ex-NRGN", rownames(ncells.freq)), ]))
+
+mask = (Ex.perc >= 10) & (Ex.perc <= 80) 
+pb.sce.filtered = pb.sce[, mask]
+
+
+# filter.mask = (pb.sce.filtered$genes > 5000) | (pb.sce.filtered$genes < 2000)
+# filter.mask = (pb.sce.filtered$genes < 2000)
+# pb.sce.filtered = pb.sce.filtered[, !filter.mask]
+
+```
+
+
+
+
+# Performing DE
+```{r}
+require(limma)
+require(muscat)
+
+conds = c("BD", "SZ")
+
+DE.tables = vector("list", length(conds))
+names(DE.tables) = conds
+
+for(k in 1:2) {
+  pb.sce.cond = pb.sce.filtered[, pb.sce.filtered$Phenotype %in% c("CON", conds[[k]])]
+  pb.sce.cond$group_id = factor(pb.sce.cond$Phenotype, c("CON", conds[[k]]))
+  
+  pb.sce.cond$PMI.z = scale(pb.sce.cond$PMI)
+
+  ll = c("Young", "Old")
+  groups<- factor(ll[as.numeric(cut(pb.sce.cond$Age,breaks = 2))], ll)
+  pb.sce.cond$Age.group = groups
+   
+  form = ~ 0 + Phenotype + Batch + Gender + Age.group + PMI.z #+ Benzodiazepines + AntipsychAtyp + Antidepress  + AntipsychTyp + Anticonvulsants
+  
+  sample.metadata = droplevels(data.frame(colData(pb.sce.cond)))
+  sample.metadata$Phenotype = factor(sample.metadata$Phenotype, c("CON", conds[[k]]))
+  design.mat <- model.matrix(form, data = sample.metadata)
+  contrast.mat <- makeContrasts(contrasts = list(sprintf("Phenotype%s-PhenotypeCON", conds[[k]])), levels = design.mat)
+  
+  
+  # require(RNOmni)
+  # pb.sce.cond.scaled = pb.sce.cond
+  # ncells = do.call(rbind, pb.sce.cond.scaled@int_colData$n_cells)
+  # for(i in 1:length(assays(pb.sce.cond.scaled))) {
+  #   print(i)
+  #   X = assays(pb.sce.cond.scaled)[[i]]
+  #   # cs = fast_column_sums(X)
+  #   # cs[cs == 0] = 1
+  #   # X.norm = median(cs) * scale(X, center = F, scale = cs)
+  #   X.norm = (X)
+  #   # X.norm = scale(X.norm)
+  #   # X.norm = (apply(X.norm, 2, RankNorm))
+  #   # 
+  #   X.norm[is.na(X.norm)] = 0
+  #   # w = ncells[, i]
+  #   # w = w / sum(w)
+  #   # X.norm = orthoProject(X.norm, X.norm %*% w)
+  #   # X.norm = orthoProject(X.norm, fastRowMeans(X.norm))
+  # 
+  #   # X.norm = (apply(X.norm, 2, RankNorm))
+  #   # X.norm = t(apply(X.norm, 1, RankNorm))
+  #   X.norm[is.na(X.norm)] = 0
+  #   assays(pb.sce.cond.scaled)[[i]] = X.norm
+  # }
+  
+  df.DE = pbDS(pb.sce.cond, method = "limma-trend", min_cells = 30, design = design.mat, contrast = contrast.mat, filter = "none", treat = F)
+
+  DE.tables[[k]] = df.DE$table[[1]]
+}
+
+
+```
+
+```{r}
+storeDataset(df.DE, "allDE_PB_final")
+
+lapply(1:length(DE.tables), function(i) {
+  DFs = DE.tables[[i]]
+  DFs = DFs[!(names(DFs) %in% c("Ex-NRGN", "Mic", "Endo", "Peri"))]
+
+  storeTable(DFs, name = sprintf("DE_tables_%s_final", names(DE.tables)[[i]]), tables.path = tables.path)
+})
+
+```
+
+```{r}
+cg = intersect(rownames(X1), rownames(X2))
+CC = cor(X1[cg, cts], X2[cg, cts])
+Heatmap(CC, cluster_rows = F, cluster_columns = F)
+
+```
+```{r}
+ct = sort(unique(Reduce("intersect", lapply(DE.tables, function(X) names(X)))))
+library(qvalue)
+set.seed(0)
+Pi1s = sapply(1:length(DE.tables), function(i) {
+  DFs = DE.tables[[i]][ct]
+  Pi1 = sapply(DFs[], function(df) {
+    pi1 = 1- qvalue(df$p_val)$pi0
+  })
+})
+colnames(Pi1s) = names(DE.tables)
+
+
+Gene.counts = sapply(1:length(DE.tables), function(i) {
+  DFs = DE.tables[[i]][ct]
+  gc = sapply(DFs, function(df) {
+   length(df$gene[ (df$p_adj.loc < 0.05) & (abs(df$logFC) > 0.1)])
+  })
+})
+
+Pi1s = as.data.frame(Pi1s)
+Pi1s = cbind(data.frame(Celltype = rownames(Pi1s)), Pi1s)
+storeTable(list(Pi1 = Pi1s), name = "Pi1_final", tables.path = tables.path)
+
+
+X = as.matrix(Pi1s[, -1])
+Y = as.matrix(Gene.counts)
+# X = as.matrix(Pi1s[, -c(1, 4)])
+perm = order(X[, 1], decreasing = T)
+X = X[perm , ]
+X[X < 0.05] = 0
+Y = Y[perm, ]
+Y[Y == 0] = NA
+require(ComplexHeatmap)
+Cpal = viridis::magma(11)#circlize::colorRamp2(seq(0, 0.5, length.out = 10), c("white", pals::brewer.purples(9)))
+ht = Heatmap(X, cluster_rows = F, cluster_columns = F, row_names_gp = gpar(col = cols[rownames(X)]), rect_gp = gpar(col = "darkgrey"), row_names_side = "left", name = "Pi1", col = Cpal) + Heatmap(Y, cluster_rows = F, cluster_columns = F, row_names_gp = gpar(col = cols[rownames(X)]), rect_gp = gpar(col = "darkgrey"), row_names_side = "left", name = "# genes", col = blues9)
+  
+storeFigure(ht, "Pi1_heatmap_final", extension = "pdf", height = 6, width = 2.75, figures.path = figures.path)
+
+```
+
+
+```{r}
+PEC = readr::read_tsv("~/results/input/PEC_DE_table.csv")
+PEC = PEC[PEC$gene_name %in% rownames(pb.sce), ]
+# v=PEC$BD.log2FC
+# v[is.na(v)] = 0
+# plot(density(v))
+
+# PEC.BD.Up = PEC[(PEC$BD.fdr < 0.05), ]
+
+PEC.BD.Up = PEC$gene_name[(PEC$BD.t.value > 3)]
+PEC.BD.Down = PEC$gene_name[(PEC$BD.t.value < -3)]
+PEC.BD = list(BD.Up = PEC.BD.Up, BD.Down = PEC.BD.Down)
+
+
+PEC.SCZ.Up = PEC$gene_name[(PEC$SCZ.t.value > 3)]
+PEC.SCZ.Down = PEC$gene_name[(PEC$SCZ.t.value < -3)]
+PEC.SCZ = list(SZ.Up = PEC.SCZ.Up, SZ.Down = PEC.SCZ.Down)
+
+PEC.DE = c(PEC.SCZ, PEC.BD)
+
+PEC.tstats = as.matrix(PEC[, grep("t.value", colnames(PEC))])
+rownames(PEC.tstats) = PEC$gene_name
+
+```
+
+```{r}
+scores = vector("list", length(DE.tables))
+names(scores) = names(DE.tables)
+for(i in 1:length(DE.tables)) {
+  DFs = DE.tables[[i]]
+  cts = setdiff(names(DFs), c("Ex-NRGN"))
+  cts = cts[grep("^Ex|^In", cts)]
+
+  common.genes = unique(Reduce("intersect", lapply(DFs[cts], function(x) x$gene)))
+  X = do.call(cbind, lapply(DFs[cts], function(DF) {
+    # v = abs(DF$t[match(common.genes, DF$gene)])
+    v = DF$t[match(common.genes, DF$gene)]
+    # v[abs(DF$logFC[match(common.genes, DF$gene)]) < logFC_threshold] = 0
+    return(v)    
+  }))
+  rownames(X) = common.genes  
+  
+  scores[[i]] = X
+}
+
+X1 = scores[[1]]
+X2 = scores[[2]]
+
+cg = intersect(rownames(X1), rownames(PEC.tstats))
+CC.BD = cor(X1[cg, ], PEC.tstats[cg, ])
+Heatmap(1+CC.BD)
+
+cg = intersect(rownames(X2), rownames(PEC.tstats))
+CC.SZ = cor(X2[cg, ], PEC.tstats[cg, ])
+Heatmap(1+CC.SZ)
+
+```
+
+
+
+```{r}
+assess.genesets <- function (arch.gs, terms.gs, N, min.pval = 1e-100, correct = TRUE) 
+{
+    shared = t(sapply(terms.gs, function(gs1) {
+        sapply(arch.gs, function(gs2) {
+            nn = intersect(gs1, gs2)
+            length(nn)
+        })
+    }))
+    # colnames(shared) = names(arch.gs)
+    GS.sizes = sapply(terms.gs, length)
+
+  
+    logPvals.out = sapply(1:ncol(shared), function(i) {
+        x = shared[, i]
+        n.sample = length(arch.gs[[i]])
+        n.success = as.numeric(GS.sizes)
+        v = rep(0, length(x))
+        # min.overlap = n.success * n.sample/N
+        # idx = which(x >= min.overlap)
+        # if (length(idx) == 0) 
+        #     return(v)
+        # v[idx] = HGT_tail(population.size = N, success.count = n.success[idx], 
+        #     sample.size = n.sample, observed.success = x[idx])
+        v = HGT_tail(population.size = N, success.count = n.success, 
+            sample.size = n.sample, observed.success = x)        
+        return(v)
+    })
+    rownames(logPvals.out) = names(terms.gs)
+    colnames(logPvals.out) = names(arch.gs)
+    return(Matrix::t(logPvals.out))
+}
+```
+
+
+```{r}
+DEs.Down = lapply(DE.tables, function(DFs) {
+  XX = lapply(1:length(DFs), function(i) {
+    DF = DFs[[i]]
+    subDF = DF[ (DF$p_adj.loc < 0.05) & (DF$logFC < -0.1), ]
+    # if(nrow(subDF) > 0)
+    #   subDF$celltype = names(DFs)[[i]]
+    return(subDF)
+  })
+  XX = XX[!sapply(XX, is.null)]
+  return(XX)
+})
+DF.Down = do.call(rbind, unlist(DEs.Down,recursive = F))
+
+DEs.Up = lapply(DE.tables, function(DFs) {
+  XX = lapply(1:length(DFs), function(i) {
+    DF = DFs[[i]]
+    subDF = DF[ (DF$p_adj.loc < 0.05) & (DF$logFC > 0.1), ]
+    # if(nrow(subDF) > 0)
+    #   subDF$celltype = names(DFs)[[i]]
+    return(subDF)
+  })
+  XX = XX[!sapply(XX, is.null)]
+  return(XX)
+})
+DF.Up = do.call(rbind, unlist(DEs.Up,recursive = F))
+
+DFs = list(Up = DF.Up, Down = DF.Down)
+storeDataset(DFs, "selected_DE_genes", dataset.path = dataset.path)
+storeTable(DFs, "selected_DE_genes", tables.path = tables.path)
+
+
+
+
+```
+
+```{r}
+
+# DEs.Down = unlist(DEs.Down,recursive = F)
+# DEs.Down = DEs.Down[lapply(DEs.Down, function(gs) length(gs)) > 30]
+# df.Up = reshape2::melt(DEs.Up)
+
+DEs.Up = lapply(DE.tables, function(DFs) {
+  lapply(DFs, function(DF) {
+    subDF = DF[ (DF$p_adj.loc < 0.05) & (DF$logFC > 0.1), ]
+  })
+})
+DEs.Up = unlist(DEs.Up,recursive = F)
+DEs.Up = DEs.Up[lapply(DEs.Up, function(gs) length(gs)) > 30]
+df.Up = reshape2::melt(DEs.Up)
+
+En.Up = assess.genesets(DEs.Up, PEC.DE, nrow(pb.sce))
+En.Down = assess.genesets(DEs.Down, PEC.DE, nrow(pb.sce))
+
+Z1 = (En.Up)
+Z1[is.na(Z1)] = 0
+Z2 = (En.Down)
+Z2[is.na(Z2)] = 0
+Heatmap(Z1[grep("BD", rownames(Z1)), , drop = F], cluster_columns = F, column_title = "BD Up")
+Heatmap(Z2[grep("BD", rownames(Z2)), , drop = F], cluster_columns = F, column_title = "BD Down")
+Heatmap(Z1[grep("SZ", rownames(Z1)), ,drop = F], cluster_columns = F, column_title = "SZ Up")
+Heatmap(Z2[grep("SZ", rownames(Z2)), , drop = F], cluster_columns = F, column_title = "SZ Down")
+
+```
+
+
+
+
+# Validate DE wrt prior data
+```{r, eval = F}
+SZ.DE = readr::read_rds("~/results/datasets/Cohort_specific_DE_results.rds")
+cg.old = unique(Reduce("intersect", lapply(SZ.DE$McLean$table$PhenotypeSZ, function(x) x$gene)))
+
+SZ.tstat.old = do.call(cbind, lapply(SZ.DE$McLean$table$PhenotypeSZ, function(DF) DF$t[match(cg.old, DF$gene)]))
+rownames(SZ.tstat.old) = cg.old
+
+
+SZ.genes = readr::read_rds("~/results/datasets/SCZ_associated_genesets.rds")
+
+
+cg.new = unique(Reduce("intersect", lapply(DE.tables[[2]], function(x) x$gene)))
+SZ.tstat.new = do.call(cbind, lapply(DE.tables[[2]], function(DF) DF$t[match(cg.new, DF$gene)]))
+rownames(SZ.tstat.new) = cg.new
+
+cg = intersect(rownames(SZ.tstat.new), rownames(SZ.tstat.old))
+cc = intersect(colnames(SZ.tstat.new), colnames(SZ.tstat.old))
+CC = diag(cor(SZ.tstat.new[cg, cc], SZ.tstat.old[cg, cc]))
+print(CC)
+print(mean(CC))
+
+SZ.genes.down = lapply(DE.tables[[2]], function(DF) DF$gene[(DF$p_val < 0.05) & (DF$logFC < 0)])
+SZ.genes.up = lapply(DE.tables[[2]], function(DF) DF$gene[(DF$p_val < 0.05) & (DF$logFC > 0)])
+SZ.genes.new = c(SZ.genes.up, SZ.genes.down)
+names(SZ.genes.new) = c(paste("Up", names(SZ.genes.up), sep = "_"), paste("Down", names(SZ.genes.down), sep = "_"))
+
+X = round(t(assess.genesets(SZ.genes, SZ.genes.new, nrow(pb.sce), correct = "none")), 1)
+print(apply(X, 2, function(x) sort(x, decreasing = T)[1:3]))
+
+```
+
+
+
+```{r}
+resDE = readr::read_rds(file.path(dataset.path, "allDE_PB_final.rds"))
+
+```
+
+
+
+# Export up/down-regulated genes (no p-value filtering)
+```{r}
+for(ds in 1:length(resDE)) {
+  print(names(resDE$table)[[ds]])
+  
+  DE.tbls = resDE$table[[ds]]
+  
+  Up.DFs = lapply(1:length(DE.tbls), function(i) {
+    res = DE.tbls[[i]]
+    res = res[res$logFC > logFC_threshold, ]
+    res = res[order(res$t, decreasing = T), ]
+    return(res)  
+  })
+  
+  names(Up.DFs) = names(resDE$table[[ds]])
+  storeTable(Up.DFs, name = sprintf("DE_genes_up_%s_logFC_filtered_final", names(resDE$table)[[ds]]), tables.path = tables.path)
+
+  Down.DFs = lapply(1:length(DE.tbls), function(i) {
+    res = DE.tbls[[i]]
+    res = res[res$logFC < -logFC_threshold, ]
+    res = res[order(res$t, decreasing = F), ]
+  })
+  names(Down.DFs) = names(resDE$table[[ds]])
+  storeTable(Down.DFs, name = sprintf("DE_genes_down_%s_logFC_filtered_final", names(resDE$table)[[ds]]), tables.path = tables.path)
+}
+
+```
+
+
+

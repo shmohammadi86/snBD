@@ -1,0 +1,247 @@
+---
+title: "Perform DE analysis"
+subtitle: "Step 1: Compute pseudobulk (PB) profiles"
+author: "Shahin Mohammadi"
+date: "Run on `r Sys.time()`"
+documentclass: article
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+library(ACTIONet)
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+library(corrplot)
+library(limma)
+library(muscat)
+library(metafor)
+library(ggcorrplot)
+library(synapser)
+library(synExtra)
+synLogin(rememberMe = TRUE)
+source("functions.R")
+})
+
+```
+
+
+# Setup environment
+```{r}
+tables.path = "~/BD/results/tables/"
+figures.path = "~/BD/results/figures/"
+dataset.path = "~/BD/results/datasets/"
+
+# Thresholds on the FDR-corrected meta-analysis results
+pval_threshold = 0.05
+logFC_threshold = 0.1
+max.missed.genes.per.batch = 0.9
+
+# Load pseudobulk samples
+pb.sce = readr::read_rds("~/BD/results/datasets/BD_pseudobulk_profiles.rds")
+# colors = loadDataset("celltype_colors", dataset.path = dataset.path)
+pb.sce$Phenotype = factor(pb.sce$Phenotype, c("CON", "BD", "SZ"))
+pb.sce$group_id = pb.sce$Phenotype
+
+```
+
+
+
+
+```{r}
+  min.capture.rate = 0.05
+  gene.mask = apply(rowData(pb.sce)$capture.rate, 1, max) > min.capture.rate
+  pb.sce.filtered = pb.sce[gene.mask, ]
+  form = as.formula("~ 0. + Phenotype + Age.group + Gender + PMI.z + SampleQuality")
+
+  sample.metadata = droplevels(data.frame(colData(pb.sce.filtered)))
+  	
+  sample.metadata$SampleQuality = scale(sample.metadata$umis) # pb.sce.filtered$
+  sample.metadata$PMI.z = scale(sample.metadata$PMI)
+  ll = c("Young", "Old")
+  groups<- factor(ll[as.numeric(cut(sample.metadata$Age,breaks = 2))], ll)
+  sample.metadata$Age.group = groups
+
+	design.mat <- model.matrix(form, data = sample.metadata)
+	# colnames(design.mat)[1] = c("Intercept")
+
+  
+  corrected_assays = lapply(1:length(assays(pb.sce.filtered)), function(k) {
+    print(k)
+    X = assays(pb.sce.filtered)[[k]]
+    Xres = limma::removeBatchEffect(X, batch = sample.metadata$Batch, batch2 = sample.metadata$HTO, design = model.matrix(~0. + sample.metadata$Phenotype))
+    rownames(Xres) = rownames(pb.sce.filtered)
+    colnames(Xres) = colnames(pb.sce.filtered)
+    return(Xres)
+  })
+  names(corrected_assays) = names(assays(pb.sce.filtered))
+  assays(pb.sce.filtered) = corrected_assays
+
+    
+  contrast.mat <- makeContrasts(contrasts = list("PhenotypeBD-PhenotypeCON", "PhenotypeSZ-PhenotypeCON", "PhenotypeBD-PhenotypeSZ", "(PhenotypeSZ+PhenotypeBD)/2-PhenotypeCON"), levels = design.mat)
+
+	df.DE = pbDS(pb.sce.filtered, method = "limma-trend", min_cells = 10, design = design.mat, contrast =  contrast.mat, filter = "both")
+  
+
+
+for(i in 1:length(df.DE$table)) {
+  print(names(df.DE$table)[[i]])
+  DFs = df.DE$table[[i]]
+  DFs = DFs[!(names(DFs) %in% c("Ex-NRGN", "Pericytes"))]
+  for(j in 1:length(DFs)) {
+    nn = names(DFs)[[j]]
+    DF = DFs[[j]]
+    # DF = DF[!(DF$gene %in% filtered.genes[[nn]]), ]
+    out = FDRestimation::p.fdr(DF$p_val)
+    DF$p_adj.loc = out$fdrs
+    DFs[[j]] = DF
+  }
+  pvals = unlist(lapply(DFs, function(DF) DF$p_val))
+  pvals.local = unlist(lapply(DFs, function(DF) DF$p_adj.loc))
+  pvals.global = FDRestimation::p.fdr(pvals)$fdrs # p.adjust(pvals, method = "fdr")
+  
+  print(sum(pvals.local < 0.05))
+  print(sum(pvals.global < 0.05))
+  
+  start.idx = as.numeric(c(0, cumsum(sapply(DFs, nrow))))
+  for(j in 1:length(DFs)) {
+    DF = DFs[[j]]
+    DF$p_adj.glb = pvals.global[(start.idx[j]+1):start.idx[j+1]]
+    DFs[[j]] = DF
+  }
+
+  print(sort(sapply(DFs, function(DF) sum((DF$p_adj.loc < 0.05) & (abs(DF$logFC) > 0.1)))))
+  
+    
+  df.DE$table[[i]] = DFs
+}
+	
+names(df.DE$table) = c("BD", "SZ", "BDnotSZ", "BDandSZ")
+
+storeDataset(df.DE, "allDE_PB_final_Feb2022")
+
+lapply(1:length(df.DE$table), function(i) {
+  DFs = df.DE$table[[i]]
+  # DFs = DFs[!(names(DFs) %in% c("Ex-NRGN", "Mic", "Endo", "Peri"))]
+
+  storeTable(DFs, name = sprintf("DE_tables_%s_final_Feb2022", names(df.DE$table)[[i]]), tables.path = tables.path)
+})
+
+```
+
+
+```{r}
+# DE.SZ = readr::read_rds("~/results/datasets/DE_genes_pseudobulk_final.rds")
+DE.old = readr::read_rds("~/results/datasets/Cohort_specific_DE_results_final.rds")
+
+ll = lapply(DE.old$McLean$table$PhenotypeSZ, function(tbl) {v = tbl$t; names(v) = tbl$gene; return(v)})
+common.genes = Reduce("intersect", lapply(ll, names))
+sz.t.old = do.call(cbind, lapply(ll, function(x) x[common.genes]))
+
+
+ll = lapply(df.DE$table$SZ, function(tbl) {v = tbl$t; names(v) = tbl$gene; return(v)})
+common.genes = Reduce("intersect", lapply(ll, names))
+sz.t.new = do.call(cbind, lapply(ll, function(x) x[common.genes]))
+
+common.genes = intersect(rownames(sz.t.old), rownames(sz.t.new))
+CC = cor(sz.t.old[common.genes, ], sz.t.new[common.genes, ], method = "spearman")
+
+common.ct = intersect(colnames(CC), rownames(CC))
+CC = CC[common.ct, common.ct]
+
+print(diag(CC))
+
+
+```
+
+
+```{r}
+DEs = lapply(DE.tables, function(DFs) {
+  lapply(DFs, function(DF) {
+    DF$gene[ (DF$p_adj.loc < 0.05) & (abs(DF$logFC) > 0.1)]
+  })
+})
+
+DEs = unlist(DEs,recursive = F)
+DEs = DEs[lapply(DEs, function(gs) length(gs)) > 50]
+
+gp = gProfileR::gprofiler(DEs, hier_filtering = "moderate", src_filter = "GO:BP")
+
+```
+
+
+# Validate DE wrt prior data
+```{r, eval = F}
+# SZ.DE = readr::read_rds("~/results/datasets/Cohort_specific_DE_results.rds")
+# cg.old = unique(Reduce("intersect", lapply(SZ.DE$McLean$table$PhenotypeSZ, function(x) x$gene)))
+# 
+# SZ.tstat.old = do.call(cbind, lapply(SZ.DE$McLean$table$PhenotypeSZ, function(DF) DF$t[match(cg.old, DF$gene)]))
+# rownames(SZ.tstat.old) = cg.old
+# SZ.genes = readr::read_rds("~/results/datasets/SCZ_associated_genesets.rds")
+
+dd = DE.tables[[2]]
+
+cg.new = unique(Reduce("intersect", lapply(dd, function(x) x$gene)))
+SZ.tstat.new = do.call(cbind, lapply(dd, function(DF) DF$t[match(cg.new, DF$gene)]))
+rownames(SZ.tstat.new) = cg.new
+
+cg = intersect(rownames(SZ.tstat.new), rownames(SZ.tstat.old))
+cc = intersect(colnames(SZ.tstat.new), colnames(SZ.tstat.old))
+CC = diag(cor(SZ.tstat.new[cg, cc], SZ.tstat.old[cg, cc]))
+print(CC)
+print(mean(CC))
+
+SZ.genes.down = lapply(dd, function(DF) DF$gene[(DF$p_val < 0.05) & (DF$logFC < 0)])
+SZ.genes.up = lapply(dd, function(DF) DF$gene[(DF$p_val < 0.05) & (DF$logFC > 0)])
+SZ.genes.new = c(SZ.genes.up, SZ.genes.down)
+names(SZ.genes.new) = c(paste("Up", names(SZ.genes.up), sep = "_"), paste("Down", names(SZ.genes.down), sep = "_"))
+
+X = round(t(assess.genesets(SZ.genes, SZ.genes.new, nrow(pb.sce.BD.scaled), correct = "none")), 1)
+print(apply(X, 2, function(x) sort(x, decreasing = T)[1:3]))
+
+```
+
+
+
+```{r}
+resDE = readr::read_rds(file.path(dataset.path, "allDE_PB_final.rds"))
+
+```
+
+
+
+# Export up/down-regulated genes (no p-value filtering)
+```{r}
+for(ds in 1:length(resDE)) {
+  print(names(resDE$table)[[ds]])
+  
+  DE.tbls = resDE$table[[ds]]
+  
+  Up.DFs = lapply(1:length(DE.tbls), function(i) {
+    res = DE.tbls[[i]]
+    res = res[res$logFC > logFC_threshold, ]
+    res = res[order(res$t, decreasing = T), ]
+    return(res)  
+  })
+  
+  names(Up.DFs) = names(resDE$table[[ds]])
+  storeTable(Up.DFs, name = sprintf("DE_genes_up_%s_logFC_filtered_final", names(resDE$table)[[ds]]), tables.path = tables.path)
+
+  Down.DFs = lapply(1:length(DE.tbls), function(i) {
+    res = DE.tbls[[i]]
+    res = res[res$logFC < -logFC_threshold, ]
+    res = res[order(res$t, decreasing = F), ]
+  })
+  names(Down.DFs) = names(resDE$table[[ds]])
+  storeTable(Down.DFs, name = sprintf("DE_genes_down_%s_logFC_filtered_final", names(resDE$table)[[ds]]), tables.path = tables.path)
+}
+
+```
+
+
+

@@ -1,0 +1,212 @@
+---
+title: "Perform DE analysis"
+subtitle: "Step 1: Compute pseudobulk (PB) profiles"
+author: "Shahin Mohammadi"
+date: "Run on `r Sys.time()`"
+documentclass: article
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r include=FALSE}
+devtools::load_all("~/ACTIONet/")
+
+tables.path = "~/BD/results/tables/"
+figures.path = "~/BD/results/figures/"
+dataset.path = "~/BD/results/datasets/"
+
+```
+
+```{r}
+storeDataset = function( obj, name, description = NULL, dataset.path = "results/datasets"){
+  file_name = paste0(name, ".rds")
+  file_path = file.path(dataset.path, file_name)
+  readr::write_rds( obj, file=file_path)
+  
+  # Syn.datasets <- synStore(Syn.datasets)
+  # folder = Syn.datasets$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }	
+  # OBJ = File(file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )	
+}
+
+storeTable = function( DFs, name, description = NULL, tables.path = "results/tables"){
+  if(is.null(names(DFs))) {
+    names(DFs) = paste("Table", 1:length(DFs), sep = "")
+  }
+  wb <- openxlsx::createWorkbook()
+  for(i in 1:length(DFs)) {
+    n = names(DFs)[[i]] 
+    openxlsx::addWorksheet(wb=wb, sheetName = n)
+    openxlsx::writeData(wb, sheet = n, DFs[[i]]) 
+  }
+  file_name = paste0(name, ".xlsx")
+  file_path = file.path(tables.path, file_name)
+  openxlsx::saveWorkbook(wb, file_path, overwrite = TRUE)
+  
+  # Syn.tables <- synStore(Syn.tables)
+  # folder = Syn.tables$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }
+  # OBJ = File(path = file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )	
+}
+
+
+# Store figure
+storeFigure = function( gg, name, extension, description = NULL, width = 10, height = 8, figures.path = "results/figures"){
+  if(extension == "png") {
+    file_name = paste0(name, ".png")
+    file_path = file.path(figures.path, file_name)
+    png(file_path, width = width, height = height, units = "in", res = 300)
+  } else if(extension == "pdf") {
+    file_name = paste0(name, ".pdf")
+    file_path = file.path(figures.path, file_name)
+    pdf(file_path, width = width, height = height)
+  }
+  print(gg)
+  dev.off()
+  
+  # Syn.figures <- synStore(Syn.figures)
+  # folder = Syn.figures$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }  
+  # OBJ = File(path = file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )
+}
+```
+
+
+```{r}
+ace = readr::read_rds("~/BD/results/datasets/ACTIONet_v2.rds")
+
+cols= readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+```
+
+```{r}
+f = droplevels(interaction(ace$Batch, ace$HTO, ace$Celltype_inferred))
+cc = table(f)
+names(cc)[(cc > 30)]
+
+```
+
+
+# Setup environment
+```{r}
+pb.sce = readr::read_rds("~/BD/results/datasets/BD_pseudobulk_profiles.rds")
+
+cols= readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+```
+
+# Prefilter outlier samples using % of excitatory neurons
+SZ33 is removed due to having > 80% ExNeu, and samples SZ3, SZ15, SZ24, SZ29 are removed due to having less than 10% ExNeu
+```{r}
+ncells = t(do.call(rbind, pb.sce@int_colData$n_cells))
+
+cs = Matrix::colSums(ncells)
+ncells.freq = 100*scale(ncells, center = F, scale = cs)
+Ex.perc = (fast_column_sums(ncells.freq[grepl("^Ex", rownames(ncells.freq)) & !grepl("^Ex-NRGN", rownames(ncells.freq)), ]))
+
+mask = (Ex.perc >= 10) & (Ex.perc <= 80) 
+pb.sce.filtered = pb.sce[, mask]
+
+```
+
+```{r}
+require(limma)
+require(muscat)
+require(edgeR)
+require(Pigengene)
+library(doParallel)
+registerDoParallel(cores=40)
+
+capture.rate = rowData(pb.sce.filtered)$capture.rate
+ncells = do.call(rbind, pb.sce.filtered@int_colData$n_cells)
+
+pb.sce.BD = pb.sce.filtered #[, pb.sce.filtered$Phenotype != "SZ"]
+pb.sce.BD$group_id = factor(pb.sce.BD$Phenotype, c("CON", "BD", "SZ"))
+
+pb.sce.BD$SampleQuality = scale(log1p(pb.sce.BD$umis))
+form = ~ Phenotype + Batch + PMI + Gender + Age + Benzodiazepines + Anticonvulsants + AntipsychTyp + AntipsychAtyp + Antidepress + SampleQuality
+
+sample.metadata = droplevels(data.frame(colData(pb.sce.BD)))
+sample.metadata$Phenotype = factor(sample.metadata$Phenotype, c("CON", "BD", "SZ"))
+design.mat <- model.matrix(form, data = sample.metadata)
+colnames(design.mat)[1] = c("Intercept")
+
+contrast.mat <- makeContrasts(contrasts = list("PhenotypeBD", "PhenotypeBD-PhenotypeSZ", "(PhenotypeBD+PhenotypeSZ)/2", "PhenotypeSZ", "PhenotypeSZ-PhenotypeBD"), levels = design.mat)
+
+for(i in 2:length(assays(pb.sce.filtered))) {
+  print(names(assays(pb.sce.filtered))[[i]])
+  
+  X = assays(pb.sce.filtered)[[i]]
+  cs = fast_column_sums(X)
+  ind.mask = (cs > 0) & (scale(ncells[, i]) > -1)
+  X = median(cs[ind.mask]) * scale(X[, ind.mask], center = F, scale = cs[ind.mask])
+  if(nrow(X) < ncol(pb.sce.filtered)/ 2) 
+    next
+  
+  gene.mask = capture.rate[, i] > 0.1
+  X = scale(t(X[gene.mask, ]))
+  
+  l = pb.sce.filtered$Phenotype[ind.mask]
+  names(l) = rownames(X)
+  
+  
+  system.time( {p <- one.step.pigengene(Data=X,saveDir=sprintf("~/BD/results/WGCNA/%s", names(assays(pb.sce))[[i]]), bnNum=0, verbose=1, seed=1, Labels=l, toCompact=FALSE, doHeat=TRUE)} )
+  
+  mod.genes = split(p$moduleRes$genes, p$moduleRes$moduleColors)
+  mod.mask = names(mod.genes) != "grey"
+  mod.genes = mod.genes[mod.mask]  
+  eigen.genes = p$pigengene$eigengenes[, mod.mask]
+  
+  fit0 = limma::lmFit(t(eigen.genes), design.mat[ind.mask, ], weights = ncells[ind.mask, i])
+
+  DFs = lapply(1:ncol(contrast.mat), function(j) {
+    fit <- limma::contrasts.fit(fit0, contrasts = contrast.mat[, j, drop = F])
+    fit <- limma::eBayes(fit, robust=F, trend=T, proportion = 0.01)#, trend = TRUE, proportion = 0.05)
+    DF = limma::topTable(
+      fit = fit,
+      number = Inf,
+      adjust.method = "BH",
+      sort.by = "none"
+    )  
+  })  
+  names(DFs) = colnames(contrast.mat)
+  print(max(-log10(unlist(lapply(DFs, function(DF) DF$P.Value)))))
+  
+  out = list(gene.modules = mod.genes, eigengenes = eigen.genes, fit = DFs)
+  readr::write_rds(out, sprintf("~/BD/results/WGCNA/%s/summary_results.rds", names(assays(pb.sce))[[i]]))
+}
+
+```
+
+```{r}
+
+X =  lapply(2:length(assays(pb.sce.filtered)), function(i) {
+  out = readr::read_rds(sprintf("~/BD/results/WGCNA/%s/summary_results.rds", names(assays(pb.sce))[[i]]))
+
+  rownames(out$fit$PhenotypeBD)[out$fit$PhenotypeBD$P.Value < 0.05]
+})
+names(X) = names(assays(pb.sce.filtered))[2:27]
+
+colnames(X) = names(assays(pb.sce.filtered))[2:27]
+rownames(X) = 
+X[abs(X) < 3] = 0
+require(ComplexHeatmap)
+Heatmap(X)
+
+```
+
+

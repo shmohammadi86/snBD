@@ -1,0 +1,38 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r include=FALSE}
+# devtools::load_all("~/ACTIONet/")
+# install.packages("~/ACTIONet/", repos = NULL)
+library(ACTIONet)
+
+
+# source("~/snSZ_v2/functions.R")
+
+```
+
+```{r}
+combined.ace = readr::read_rds("~/BD/results/datasets/ACTIONet_v2.rds")
+
+cols= readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+
+
+```
+
+```{r}
+tl = compute_archetype_core_centrality(combined.ace$ACTIONet, combined.ace$Celltype_inferred)
+gg = plot.ACTIONet(combined.ace, combined.ace$Celltype_inferred, point_size = 0.3, palette = cols, trans_attr = tl, use_repel = TRUE)
+
+png("~/BD/results/figures/ACTIONet_final_cleaned2022.png", res = 150, width = 1200, height = 900)
+print(gg)
+dev.off()
+
+
+
+
+
+```
+

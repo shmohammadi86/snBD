@@ -1,0 +1,528 @@
+---
+title: "Perform DE analysis"
+subtitle: "Step 1: Compute pseudobulk (PB) profiles"
+author: "Shahin Mohammadi"
+date: "Run on `r Sys.time()`"
+documentclass: article
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r include=FALSE}
+devtools::load_all("~/ACTIONet/")
+
+tables.path = "~/BD/results/tables/"
+figures.path = "~/BD/results/figures/"
+dataset.path = "~/BD/results/datasets/"
+
+```
+
+```{r}
+storeDataset = function( obj, name, description = NULL, dataset.path = "results/datasets"){
+  file_name = paste0(name, ".rds")
+  file_path = file.path(dataset.path, file_name)
+  readr::write_rds( obj, file=file_path)
+  
+  # Syn.datasets <- synStore(Syn.datasets)
+  # folder = Syn.datasets$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }	
+  # OBJ = File(file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )	
+}
+
+storeTable = function( DFs, name, description = NULL, tables.path = "results/tables"){
+  if(is.null(names(DFs))) {
+    names(DFs) = paste("Table", 1:length(DFs), sep = "")
+  }
+  wb <- openxlsx::createWorkbook()
+  for(i in 1:length(DFs)) {
+    n = names(DFs)[[i]] 
+    openxlsx::addWorksheet(wb=wb, sheetName = n)
+    openxlsx::writeData(wb, sheet = n, DFs[[i]]) 
+  }
+  file_name = paste0(name, ".xlsx")
+  file_path = file.path(tables.path, file_name)
+  openxlsx::saveWorkbook(wb, file_path, overwrite = TRUE)
+  
+  # Syn.tables <- synStore(Syn.tables)
+  # folder = Syn.tables$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }
+  # OBJ = File(path = file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )	
+}
+
+
+# Store figure
+storeFigure = function( gg, name, extension, description = NULL, width = 10, height = 8, figures.path = "results/figures"){
+  if(extension == "png") {
+    file_name = paste0(name, ".png")
+    file_path = file.path(figures.path, file_name)
+    png(file_path, width = width, height = height, units = "in", res = 300)
+  } else if(extension == "pdf") {
+    file_name = paste0(name, ".pdf")
+    file_path = file.path(figures.path, file_name)
+    pdf(file_path, width = width, height = height)
+  }
+  print(gg)
+  dev.off()
+  
+  # Syn.figures <- synStore(Syn.figures)
+  # folder = Syn.figures$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }  
+  # OBJ = File(path = file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )
+}
+```
+
+
+# Setup environment
+```{r}
+# Thresholds on the FDR-corrected meta-analysis results
+pval_threshold = 0.05
+logFC_threshold = 0.1
+
+# Load pseudobulk samples
+pb.sce = readr::read_rds("~/BD/results/datasets/BD_pseudobulk_profiles.rds")
+
+```
+
+
+# Prefilter outlier samples using % of excitatory neurons
+SZ33 is removed due to having > 80% ExNeu, and samples SZ3, SZ15, SZ24, SZ29 are removed due to having less than 10% ExNeu
+```{r}
+ncells = t(do.call(rbind, pb.sce@int_colData$n_cells))
+
+cs = Matrix::colSums(ncells)
+ncells.freq = 100*scale(ncells, center = F, scale = cs)
+Ex.perc = (fast_column_sums(ncells.freq[grepl("^Ex", rownames(ncells.freq)) & !grepl("^Ex-NRGN", rownames(ncells.freq)), ]))
+
+mask = (Ex.perc >= 10) & (Ex.perc <= 80) 
+pb.sce.filtered = pb.sce[, mask]
+
+```
+
+
+```{r}
+require(lolR)
+
+vignette('lol')
+vignette('pca')
+vignette('cpca')
+vignette('lrcca')
+vignette('mdp')
+vignette('xval')
+vignette('qoq')
+vignette('simulations')
+vignette('nearestCentroid')
+
+
+```
+
+
+```{r}
+
+  
+    DFs[[i]] = DF
+    scores[rownames(DF), i] = DF$t
+  }
+
+  if(pos.only == T)
+    scores[scores < 0] = 0 # Only "positive markers" [negative would be markers in other levels]
+  
+  blacklisted.rows = grep(blacklist.pattern, rownames(ace), ignore.case = T)
+  scores[blacklisted.rows, ] = 0
+  
+  metadata(ace)[[sprintf("%s_markers_limma", out.name)]] = DFs
+  rowMaps(ace)[[sprintf("%s_markers_limma", out.name)]] = scores
+  rowMapTypes(ace)[[sprintf("%s_markers_limma", out.name)]] = "reduction"
+  
+  return(ace)
+}
+```
+
+
+```{r}
+cts = names(assays(pb.sce.filtered))[-c(1, 26, 27)]
+PB.assays.norm = lapply(cts, function(nn) {
+  print(nn)
+  E = assays(pb.sce.filtered)[[nn]]
+  cs = Matrix::colSums(E)
+  mask = cs > 0
+  E = median(cs[mask])*scale(E[, mask], center = F, scale = cs[mask])
+
+  return(E)
+})
+names(PB.assays.norm) = cts
+```
+
+```{r}
+require(edgeR)
+require(limma)
+
+  ncells = do.call(rbind, pb.sce.filtered@int_colData$n_cells)
+  
+  stats = rep(0, length(cts))
+  DFs = vector("list", length(cts))
+  names(DFs) = names(stats) = cts
+  
+  for(k in 1:length(cts)) {
+    print(cts[[k]])
+    #X = PB.assays.norm[[cts[[k]]]] # TEST: Different normalizations (including quantile norm, before/after norm)
+    X = assays(pb.sce.filtered)[[cts[[k]]]]
+    #X=normalizeQuantiles(X,ties=TRUE)
+
+    
+    idx = match(colnames(X), pb.sce.filtered$Individual)
+    weight = ncells[idx, cts[[k]]]
+    
+    pb.sce.filtered$SampleQuality = scale(log1p(pb.sce.filtered$umis))
+    form = ~ Phenotype + Batch + PMI + Gender + Age + Benzodiazepines + Anticonvulsants + AntipsychTyp + AntipsychAtyp + Antidepress + SampleQuality # + ncells
+    sample.metadata = droplevels(data.frame(colData(pb.sce.filtered)[idx, ]))
+    sample.metadata$Phenotype = factor(sample.metadata$Phenotype, c("CON", "BD", "SZ"))
+    sample.metadata$ncells = weight
+    design.mat <- model.matrix(form, data = sample.metadata)
+    
+    colnames(design.mat)[1] = c("Intercept")
+    
+    
+    
+    # TEST: Prefiltering genes
+    fit0 = limma::lmFit(X, design.mat, weights = weight) # TEST:: With and w/o weights
+    
+  	contrast.mat <- makeContrasts(contrasts = "PhenotypeBD", levels = design.mat) # TEST: Different contrasts
+    fit <- limma::contrasts.fit(fit0, contrasts = contrast.mat)
+    fit <- limma::eBayes(fit, robust=F, trend=T, proportion = 0.01)#, trend = TRUE, proportion = 0.05)
+    DF = limma::topTable(
+      fit = fit,
+      number = Inf,
+      adjust.method = "BH",
+      sort.by = "none"
+    )
+    
+    # x = DF$AveExpr
+    # x = log(x)
+    # z = (x - median(x)) / mad(x)
+    # DF = DF[z > -1, ]
+    # DF$adj.P.Val = p.adjust(DF$P.Value, method = "fdr")
+    
+    DFs[[k]] = DF
+
+    stats[k] = sum(abs(DFs[[k]]$t) > 3)
+  }
+  
+  print(stats)
+  print(sort(stats, decreasing = T))
+  mean(stats)
+  sd(stats)
+  
+  # DF = DFs$`Ex-L6_CC_SEMA3A`
+  # DF = DFs$`Ex-L45_MET`
+  
+  # ggscatter(DF, "AveExpr", "t")
+  
+  
+```
+
+```{r}
+
+```
+
+
+# LDA
+```{r}
+i = 1
+r = 3
+Y = pb.sce.filtered$Phenotype
+Y.IDX = split(1:ncol(pb.sce.filtered), Y)
+
+acc = lapply(1:length(PB.assays.norm), function(i) {
+  X = PB.assays.norm[[i]]
+  
+  sigmas = apply(sapply(Y.IDX, function(idx) round(apply(X[idx, ], 2, mean), 3)), 1, sd)
+  X = X[, sigmas != 0]  
+
+  nn = names(PB.assays.norm)[[i]]
+  print(nn)
+
+  ### LDA
+  system.time( {model <- MASS::lda(X, Y)} )
+  plot(model)
+
+  pred <- predict(model, X)
+  lhat <- sum(pred$class == Y)/length(Y)
+  
+  df = cbind(as.data.frame(pred$x), as.data.frame(colData(pb.sce.filtered)))
+  df$Label = ""
+  mask = (apply(pred$posterior, 1, max) > 0.75) & (pred$class != Y)
+  df$Label[mask] = df$ID[mask]
+
+require(ggpubr)
+ggscatter(df, x = "LD1", y = "LD2",
+   color = "Phenotype",
+   label = "Label", repel = TRUE)
+
+  
+  # DP
+  res = lolR::lol.project.dp(X, Y)
+  
+  vignette('pls')
+
+
+  lhat <- sum(pred$class == Y)/length(Y)
+  
+  df = cbind(as.data.frame(res$Xr), as.data.frame(colData(pb.sce.filtered)))
+  colnames(df)[c(1,2)] = c("x", "y")
+  df$Label = ""
+  mask = (apply(pred$posterior, 1, max) > 0.75) & (pred$class != Y)
+  df$Label[mask] = df$ID[mask]
+
+require(ggpubr)
+ggscatter(df, x = "x", y = "y",
+   color = "Phenotype",
+   label = "Label", repel = TRUE)
+
+
+
+ return(lhat)
+})
+
+x = unlist(acc)
+names(x) = cts
+sort(x, decreasing = T)
+
+```
+
+# LOL approach
+```{r}
+i = 1
+r = 3
+Y = pb.sce.filtered$Phenotype
+
+acc = lapply(1:length(PB.assays.norm), function(i) {
+  X = PB.assays.norm[[i]]
+  sigmas = apply(sapply(Y.IDX, function(idx) round(apply(X[idx, ], 2, mean), 3)), 1, sd)
+  X = X[, sigmas != 0]  
+  
+  nn = names(PB.assays.norm)[[i]]
+  print(nn)
+  
+  ## LOL
+  result <- lol.project.lol(X, Y, r)
+  
+  data <- data.frame(x1=result$Xr[,1], x2=result$Xr[,2], y=Y)
+  data$y <- factor(data$y)
+  gg1 = ggplot(data, aes(x=x1, y=x2, color=y)) +
+    geom_point() +
+    xlab("x1") +
+    ylab("x2") +
+    ggtitle("Projected Data using LOL")
+  
+  print(gg1)
+  
+  ### LDA
+  liney <- MASS::lda(result$Xr, Y)
+  result <- predict(liney, result$Xr)
+  lhat <- sum(result$class == Y)/length(Y)
+  
+  data <- data.frame(x1=result$x[,1], y=Y)
+  data$y <- factor(data$y)
+ gg2 =  ggplot(data, aes(x=x1, fill=y)) +
+    geom_density(adjust=1.5, alpha=0.6) +
+    xlab("x1") +
+    ylab("Density") +
+    ggtitle(sprintf("LOL, LDA, Accuracy = %.2f %% (%s)", 100*lhat, nn))
+ print(gg2)
+ 
+ return(lhat)
+})
+
+x = unlist(acc)
+names(x) = cts
+sort(x, decreasing = T)
+
+
+```
+
+# LOL approach
+```{r}
+i = 1
+r = 3
+Y = factor(pb.sce.filtered$Phenotype)
+
+acc = lapply(1:length(PB.assays.norm), function(i) {
+  X = PB.assays.norm[[i]]
+  sigmas = apply(sapply(Y.IDX, function(idx) round(apply(X[idx, ], 2, mean), 3)), 1, sd)
+  X = X[, sigmas != 0]  
+  
+  nn = names(PB.assays.norm)[[i]]
+  print(nn)
+  
+  ## LOL
+  result <- lol.project.lol(X, Y, r)
+ #  data <- data.frame(x1=result$Xr[,1], y=Y)
+ #  data$y <- factor(Y)
+ # gg2 =  ggplot(data, aes(x=x1, fill=y)) +
+ #    geom_density(adjust=1.5, alpha=0.6) +
+ #    xlab("x1") +
+ #    ylab("Density") +
+ #    ggtitle(sprintf("LOL, LDA, Accuracy = %.2f %% (%s)", 100*lhat, nn))
+ # print(gg2)
+
+  data <- data.frame(x1=result$Xr[,1], x2=result$Xr[,2], y=Y)
+  data$y <- factor(data$y)
+  gg1 = ggplot(data, aes(x=x1, y=x2, color=y)) +
+    geom_point() +
+    xlab("x1") +
+    ylab("x2") +
+    ggtitle("Projected Data using LOL")
+  
+  print(gg1)
+  
+  ### LDA
+  liney <- MASS::lda(result$Xr, Y)
+  result <- predict(liney, result$Xr)
+  lhat <- sum(result$class == Y)/length(Y)
+  
+  data <- data.frame(x1=result$x[,1], y=Y)
+  data$y <- factor(data$y)
+ gg2 =  ggplot(data, aes(x=x1, fill=y)) +
+    geom_density(adjust=1.5, alpha=0.6) +
+    xlab("x1") +
+    ylab("Density") +
+    ggtitle(sprintf("LOL, LDA, Accuracy = %.2f %% (%s)", 100*lhat, nn))
+ print(gg2)
+ 
+ return(lhat)
+})
+
+x = unlist(acc)
+names(x) = cts
+sort(x, decreasing = T)
+
+
+```
+
+
+```{r}
+TSC.ace = readr::read_rds("~/TSC/TSC2_final_ACTIONet_mito_filtered.rds")
+TSC = readr::read_rds("~/MA")
+
+X = TSC
+Y = TSC.ace$Label
+nn = "TSC"
+  for (method in c("lol", "pls", "dp", "irlda")) {
+    for (r in c(1, 2)) {
+      if(method == "lol") {
+        model <- lol.project.lol(X, Y, r)
+      } else if(method == "pls") {
+        model <- lol.project.pls(X, Y, r)
+      } else if(method == "dp") {
+        model = lol.project.dp(X, Y, r)
+      } else if(method == "lrlda") {
+        model <- lol.project.lrlda(X, Y, r)
+      } 
+    
+      if(r >= 2) {
+          data <- data.frame(x1=model$Xr[,1], x2=model$Xr[,2], y=Y)
+          gg = ggplot(data, aes(x=x1, y=x2, color=y)) +
+            geom_point() +
+            xlab("x1") +
+            ylab("x2") +
+            ggtitle(sprintf("Projected Data uisng %s (%s)", method, nn))
+      } else {
+          data <- data.frame(x1=model$Xr[,1], y=Y)
+           gg =  ggplot(data, aes(x=x1, fill=y)) +
+            geom_density(adjust=1.5, alpha=0.6) +
+            xlab("x1") +
+            ylab("Density") +
+            ggtitle(sprintf("Density %s (%s)", method, nn))
+      }
+      print(gg)
+    }
+  }
+
+```
+```{r}
+
+X = TSC
+Y = TSC.ace$Label
+nn = "TSC"
+  for (method in c("lol", "pls", "dp", "irlda")) {
+    for (r in c(1, 2)) {
+      if(method == "lol") {
+        model <- lol.project.lol(X, Y, r)
+      } else if(method == "pls") {
+        model <- lol.project.pls(X, Y, r)
+      } else if(method == "dp") {
+        model = lol.project.dp(X, Y, r)
+      } else if(method == "lrlda") {
+        model <- lol.project.lrlda(X, Y, r)
+      } 
+      
+      system.time( {model <- MASS::lda(X, Y)} )
+      pred <- predict(model, X)
+      model = list(x = pred$x[, 1])
+      if(r > 1)
+        model$y = pred$x[, 2]
+#   df$Label = ""
+#   mask = (apply(pred$posterior, 1, max) > 0.75) & (pred$class != Y)
+#   df$Label[mask] = df$ID[mask]
+# 
+# require(ggpubr)
+# ggscatter(df, x = "LD1", y = "LD2",
+#    color = "Phenotype",
+#    label = "Label", repel = TRUE)      
+      
+    
+      if(r >= 2) {
+          data <- data.frame(x1=model$Xr[,1], x2=model$Xr[,2], y=Y)
+          gg = ggplot(data, aes(x=x1, y=x2, color=y)) +
+            geom_point() +
+            xlab("x1") +
+            ylab("x2") +
+            ggtitle(sprintf("Projected Data uisng %s (%s)", method, nn))
+      } else {
+          data <- data.frame(x1=model$Xr[,1], y=Y)
+           gg =  ggplot(data, aes(x=x1, fill=y)) +
+            geom_density(adjust=1.5, alpha=0.6) +
+            xlab("x1") +
+            ylab("Density") +
+            ggtitle(sprintf("Density %s (%s)", method, nn))
+      }
+      print(gg)
+    }
+  }
+
+```
+
+
+# Performing cohort-specific DE
+```{r}
+require(limma)
+require(muscat)
+
+pb.sce.filtered$group_id = factor(pb.sce.filtered$Phenotype, c("CON", "BD", "SZ"))
+
+pb.sce.filtered$SampleQuality = scale(log1p(pb.sce.filtered$umis))
+form = ~ Phenotype + Batch + PMI + Gender + Age + Benzodiazepines + Anticonvulsants + AntipsychTyp + AntipsychAtyp + Antidepress + SampleQuality
+
+sample.metadata = droplevels(data.frame(colData(pb.sce.filtered)))
+sample.metadata$Phenotype = factor(sample.metadata$Phenotype, c("CON", "BD", "SZ"))
+design.mat <- model.matrix(form, data = sample.metadata)
+colnames(design.mat)[1] = c("Intercept")
+
+
+
+```
+

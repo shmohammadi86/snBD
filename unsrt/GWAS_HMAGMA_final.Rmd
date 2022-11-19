@@ -1,0 +1,370 @@
+---
+title: "H-MAGMA analysis"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+library(ACTIONet)
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+library(corrplot)
+library(limma)
+library(muscat)
+library(metafor)
+library(ggcorrplot)
+library(openxlsx)
+library(simplifyEnrichment)
+library(synapser)
+library(synExtra)
+synLogin(rememberMe = TRUE)
+source("functions.R")
+})
+
+knitr::opts_chunk$set(
+	error = FALSE,
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	dev = c("png", "pdf"),
+	include = FALSE,
+	tidy = FALSE
+)
+
+tables.path = "~/BD/results/tables/"
+figures.path = "~/BD/results/figures/"
+dataset.path = "~/BD/results/datasets/"
+
+```
+
+
+
+# Setup environment
+
+```{r include=FALSE}
+require(ACTIONet)
+require(ComplexHeatmap)
+
+SynGO = readr::read_rds("~/BD/results/datasets/SynGO.rds")
+
+colors = readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+pb.sce = readr::read_rds("~/BD/results/datasets/BD_pseudobulk_profiles.rds")
+
+```
+
+```{r}
+DEs = readr::read_rds("~/BD/results/datasets/allDE_PB_final_Feb2022.rds")
+DE.tbl = DEs$table$BD
+
+# DEs = loadDataset(sprintf("Phenotype%s_only_PB_final_Feb2022", "BD"), dataset.path = dataset.path)
+# DE.tbl = DEs$table$`PhenotypeBD-PhenotypeCON`
+
+Up.genes = lapply(DE.tbl, function(tbl) tbl$gene[(tbl$logFC > 0.1) & (tbl$p_adj.loc < 0.05)])
+Down.genes = lapply(DE.tbl, function(tbl) tbl$gene[(tbl$logFC < -0.1) & (tbl$p_adj.loc < 0.05)])
+
+```
+
+
+
+# Convert DE genes to ENSG and export
+```{r}
+MAGMA.path = "~/magma/"
+require(org.Hs.eg.db)
+
+suppressWarnings(ids <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = row.names(pb.sce), keytype = "SYMBOL", column = "ENSEMBL", multiVals = "first"))
+ids[is.na(ids)] = ""
+
+
+Up.genes.ENSG = sapply(Up.genes, function(gs) {
+  setdiff(sort(unique(ids[gs])), "")
+})
+
+Up.genes.ENSG.df = reshape2::melt(Up.genes.ENSG)
+Up.genes.ENSG.df = Up.genes.ENSG.df[, c(2, 1)]
+Up.genes.ENSG.df$L1 = factor(Up.genes.ENSG.df$L1, names(Up.genes))
+Up.genes.ENSG.df = Up.genes.ENSG.df[order(Up.genes.ENSG.df$L1), ]
+write.table(Up.genes.ENSG.df, file.path(MAGMA.path, "genesets", "BD_Up_genes_ENSG.tsv"), sep = "\t", col.names = F, row.names = F, quote = F)
+
+Down.genes.ENSG = sapply(Down.genes, function(gs) {
+  setdiff(sort(unique(ids[gs])), "")
+})
+Down.genes.ENSG.df = reshape2::melt(Down.genes.ENSG)
+Down.genes.ENSG.df = Down.genes.ENSG.df[, c(2, 1)]
+Down.genes.ENSG.df$L1 = factor(Down.genes.ENSG.df$L1, names(Down.genes))
+Down.genes.ENSG.df = Down.genes.ENSG.df[order(Down.genes.ENSG.df$L1), ]
+
+write.table(Down.genes.ENSG.df, file.path(MAGMA.path, "genesets", "BD_Down_genes_ENSG.tsv"), sep = "\t", col.names = F, row.names = F, quote = F)
+
+
+UpAndDown.genes.ENSG.df = rbind(Up.genes.ENSG.df, Down.genes.ENSG.df)
+UpAndDown.genes.ENSG.df$L1 = factor(UpAndDown.genes.ENSG.df$L1, names(Up.genes))
+UpAndDown.genes.ENSG.df = UpAndDown.genes.ENSG.df[order(UpAndDown.genes.ENSG.df$L1), ]
+
+write.table(UpAndDown.genes.ENSG.df, file.path(MAGMA.path, "genesets", "BD_DE_genes_ENSG_final.tsv"), sep = "\t", col.names = F, row.names = F, quote = F)
+# 
+# 
+# ggs = split(UpAndDown.genes.ENSG.df$value, UpAndDown.genes.ENSG.df$L1)
+# 
+# UpAndDown.genes.ENSG.df$genes = names(ids)[match(UpAndDown.genes.ENSG.df$value, ids)]
+# ggs2 = split(UpAndDown.genes.ENSG.df$genes, UpAndDown.genes.ENSG.df$L1)
+
+
+  
+```
+
+```{r}
+MAGMA.path = "~/magma"
+
+dl = list.dirs(file.path(MAGMA.path, "psych_arch/"), full.names = F, recursive = F)
+
+logPvals = lapply(1:length(dl), function(i) {
+  tbl = readr::read_table(file.path(MAGMA.path, "psych_arch/", dl[[i]], paste0(dl[[i]], ".genes.out")))
+  x = -log10(tbl$P)
+  names(x) = tbl$GENE
+  return(x)
+})
+
+common.genes = Reduce("intersect", lapply(logPvals, names))
+X = do.call(cbind, lapply(logPvals, function(x) x[common.genes]))
+rownames(X) = common.genes
+
+X.symbol = X
+suppressWarnings(rev.ids <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = common.genes, keytype = "ENSEMBL", column = "SYMBOL", multiVals = "first"))
+rownames(X.symbol) = rev.ids
+
+colnames(X) = colnames(X.symbol) = dl
+
+Down.combs = do.call(rbind, lapply(Down.genes, function(gs) combine.logPvals(X.symbol[intersect(rownames(X.symbol), gs), , drop = F])))
+Heatmap(Down.combs[!is.na(Down.combs[, 1]), ])
+
+```
+
+
+# Run H-MAGMA
+We run HMAGMA using  **for f in `ls hmagma/`; do (./magma --gene-results ./hmagma/$f/$f.genes.raw --set-annot genesets/UpAndDown_genes_ENSG.tsv col=2,1 --out $f\_UpAndDown &); done`**, from inside the magma folder, where hmagma are prestored the gene models scores.
+
+# Load H-MAGMA results
+
+```{r}
+MAGMA.path = "~/magma/"
+
+dl = list.dirs(file.path(MAGMA.path, "psych_arch/"), full.names = F, recursive = F)
+  HMAGMA.Pvals = matrix(1, nrow = length(assays(pb.sce)), ncol = length(dl))
+  colnames(HMAGMA.Pvals) = dl
+  rownames(HMAGMA.Pvals) = names(assays(pb.sce))
+  for(cond in dl) {
+    print(cond)
+    file.name = sprintf("%s/SZ_final/BD_%s_UpAndDown.gsa.out", MAGMA.path, cond)
+    lines = readLines(con <- file(file.name))
+    lines = str_split(lines, "\n")[-c(1:5)]
+    
+    pvals = sapply(lines, function(ll) {
+      parts = str_split(ll, " ")
+      as.numeric(parts[[1]][length(parts[[1]])])
+    })
+    
+    names(pvals) = sapply(lines, function(ll) {
+      parts = str_split(ll, " ")
+      parts[[1]][[1]]
+    })
+    
+    pvals = pvals[rownames(HMAGMA.Pvals)]
+    HMAGMA.Pvals[, cond] = pvals 
+  }
+
+HMAGMA.Pvals[is.na(HMAGMA.Pvals)]   = 1
+# pvals = HMAGMA.Pvals
+# pvals = pvals[!grepl("--", rownames(pvals)), ]  
+# pvals = apply(pvals, 2, function(p) p.adjust(p, "fdr"))
+
+# pvals[pvals > 0.1] = 1
+HMAGMA.scores = -log(HMAGMA.Pvals)
+
+Heatmap(HMAGMA.scores)
+
+readr::write_rds(HMAGMA.Pvals, file.path(dataset.path, "BD_HMAGMA_results_final.rds"))
+
+
+```
+
+
+
+# Or load preprocessed results
+```{r}
+HMAGMA.Pvals = readr::read_rds(file.path(dataset.path, "HMAGMA_results_final.rds"))
+
+schemaDF = readr::read_tsv("SCHEMA_scores.tsv")
+schemaDF$enrichment = -log(schemaDF$adjPval)
+
+# storeDataset(DF, "HMAGMA_results", dataset.path = dataset.path)
+
+```
+
+
+
+## Export selected results
+```{r}
+
+# selected.traits = c("hmagmaAdultBrain__sz3", "hmagmaAdultBrain__bdAndSczShared", "hmagmaAdultBrain__bip2", "hmagmaAdultBrain__bip2_BDI", "hmagmaAdultBrain__bip2_BDII", "hmagmaAdultBrain__asd", "hmagmaAdultBrain__mdd_without_23andMe", "hmagmaAdultBrain__alz2noapoe")
+# 
+# trait.labels = c("Schizophrenia (SZ)", "SZ & BD", "Bipolar (BD)", "Bipolar I (BDI)", "Bipolar II (BDII)", "Autism (ASD)", "Depression (MDD)", "Alzheimer (AD)")
+
+selected.traits = c("hmagmaAdultBrain__sz3", "hmagmaAdultBrain__bdAndSczShared", "hmagmaAdultBrain__bip2", "hmagmaAdultBrain__asd", "hmagmaAdultBrain__mdd_without_23andMe", "hmagmaAdultBrain__alz2noapoe")
+
+trait.labels = c("Schizophrenia (SZ)", "SZ & BD", "Bipolar (BD)", "Autism (ASD)", "Depression (MDD)", "Alzheimer (AD)")
+
+X = HMAGMA.Pvals[, selected.traits]
+cts = intersect(names(colors), rownames(X))
+X = X[cts, ]
+# X = apply(X, 2, p.adjust)
+X = matrix(p.adjust(as.numeric(X), "fdr"), nrow = length(cts))
+# X = apply(X, 2, function(p) p.adjust(p, method = "fdr"))
+rownames(X) = cts
+rownames(X) = intersect(names(colors), rownames(X))
+X = -log(X)
+colnames(X) = trait.labels
+rownames(X) = cts
+
+X = X[intersect(rownames(X), schemaDF$celltype), ]
+schemaDF = schemaDF[match(rownames(X), schemaDF$celltype), ]
+
+
+df = cbind(data.frame(Celltype = rownames(X), "SCHEMA" = schemaDF$enrichment), as.data.frame(X))
+storeTable(list(HMAGMA = df), "HMAGMA_results_final", tables.path = tables.path)
+
+X = as.matrix(df[, -1])
+X[X < -log(0.05)] = 0
+
+
+PurPal = colorRampPalette(RColorBrewer::brewer.pal(9, "Purples"))(200)
+PurPal = c(rep(PurPal[1], length(PurPal)*(sum(X < 1) / length(X))), PurPal)
+
+require(corrplot)
+pdf(file.path(figures.path, "HMAGMA_adultBrain_final_with_schema.pdf"), width =7, height = 7)
+corrplot(X, is.corr = F, method = "pie", col = PurPal, col.lim = c(0, 10), cl.length = 6, outline = T, sig.level = 0.05, p.mat = exp(-X), insig = "blank", tl.col = "black")
+dev.off()
+
+X = X[grep("^In|^Ex", rownames(X)), ]
+
+require(corrplot)
+pdf(file.path(figures.path, "HMAGMA_adultBrain_neuro_final_with_schema.pdf"), width =7, height = 7)
+corrplot(X, is.corr = F, method = "pie", col = PurPal, col.lim = c(0, 10), cl.length = 6, outline = T, sig.level = 0.05, p.mat = exp(-X), insig = "blank", tl.col = "black")
+dev.off()
+
+```
+
+# Plot "volcanos"
+## Load H-MAGMA gene p-values
+```{r}
+tbl = read.table("~/magma/hmagma/hmagmaAdultBrain__sz3/hmagmaAdultBrain__sz3.genes.out", header = T)
+suppressWarnings(ids <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = tbl$GENE, keytype = "ENSEMBL", column = "SYMBOL", multiVals = "first"))
+ids[is.na(ids)] = ""
+
+scores = rep(0, nrow(pb.sce))
+ii = match(rownames(pb.sce), ids)
+scores[!is.na(ii)] = -log10(tbl$P[ii[!is.na(ii)]])
+names(scores) = rownames(pb.sce)
+
+sort(scores, decreasing = T)[1:30]
+
+```
+
+```{r}
+selected.cts = c("Ex-L23", "Ex-L45_MET", "Ex-L56")
+idx = match(selected.cts, colnames(DE.new$DE.sc))
+
+t.threshold = 3
+magma.pval.threshold = 0.05
+
+Grobs = vector("list", length(idx))
+for(i in 1:length(idx)) {
+  k = idx[[i]]
+  df = data.frame("log2FoldChange" = DE.new$DE.sc[, k], "pvalue" = 10^(-scores))
+  rownames(df) = rownames(DE.new$DE.sc)
+  df = df[df$log2FoldChange != 0, ]
+  
+  keyvals <- rep('#cccccc', nrow(df))
+  names(keyvals) <- rep('None', nrow(df))
+  
+  keyvals[which( (df$log2FoldChange > t.threshold) & (df$pvalue < magma.pval.threshold) )] <- '#ca0020'
+  names(keyvals)[which( (df$log2FoldChange > t.threshold) & (df$pvalue < magma.pval.threshold) )] <- rep('Up', sum(keyvals == '#ca0020'))
+  
+  keyvals[which( (df$log2FoldChange < -t.threshold) & (df$pvalue < magma.pval.threshold) )] <- '#0571b0'
+  names(keyvals)[which( (df$log2FoldChange < -t.threshold) & (df$pvalue < magma.pval.threshold) )] <- rep('Down', sum(keyvals == '#0571b0'))
+  
+  
+ 
+ Grobs[[i]] = EnhancedVolcano(df,
+  lab = rownames(df),
+  x = 'log2FoldChange',
+  y = 'pvalue', pCutoff = magma.pval.threshold, FCcutoff = t.threshold, xlim = c(-4, 4), ylim = c(0, 20), title = "H-MAGMA pvals-vs-DE tstats", subtitle = colnames(DE.new$logFC)[[k]], colCustom = keyvals, labCol = 'black',
+    labFace = 'bold', caption = "")
+}  
+
+pdf(file.path(figures.path, "HMAGMA_vs_DE.pdf"), width = 8*3, height = 8*1)
+gridExtra::grid.arrange( grobs = Grobs, nrow = 1)
+dev.off()
+
+
+
+```
+
+
+```{r}
+spec = readr::read_rds("~/results/datasets/celltype_gene_specificity.rds")
+
+
+```
+
+
+# Convert DE genes to ENSG and export
+```{r}
+MAGMA.path = "~/magma/"
+require(org.Hs.eg.db)
+
+suppressWarnings(ids <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = row.names(DE.new$DE.sc), keytype = "SYMBOL", column = "ENSEMBL", multiVals = "first"))
+ids[is.na(ids)] = ""
+
+specMatched.Up.genes.ENSG = sapply(names(Up.genes), function(nn) {
+  gs = Up.genes[[nn]]
+  k = length(gs)
+  x = spec[, nn]
+  idx = order(x, decreasing = T)[1:k]
+  ggs = rownames(spec)[idx]
+  setdiff(sort(unique(ids[match(ggs, rownames(pb.sce))])), "")
+})
+
+
+specMatched.Up.genes.ENSG.df = reshape2::melt(specMatched.Up.genes.ENSG)
+specMatched.Up.genes.ENSG.df = specMatched.Up.genes.ENSG.df[, c(2, 1)]
+specMatched.Up.genes.ENSG.df$L1 = factor(specMatched.Up.genes.ENSG.df$L1, names(Up.genes))
+specMatched.Up.genes.ENSG.df = specMatched.Up.genes.ENSG.df[order(specMatched.Up.genes.ENSG.df$L1), ]
+write.table(specMatched.Up.genes.ENSG.df, file.path(MAGMA.path, "genesets", "specMatched.Up.genes.ENSG.tsv"), sep = "\t", col.names = F, row.names = F, quote = F)
+
+specMatched.Down.genes.ENSG = sapply(names(Down.genes), function(nn) {
+  gs = Down.genes[[nn]]
+  k = length(gs)
+  x = spec[, nn]
+  idx = order(x, decreasing = T)[1:k]
+  ggs = rownames(spec)[idx]
+  setdiff(sort(unique(ids[match(ggs, rownames(pb.sce))])), "")
+})
+
+specMatched.Down.genes.ENSG.df = reshape2::melt(specMatched.Down.genes.ENSG)
+specMatched.Down.genes.ENSG.df = specMatched.Down.genes.ENSG.df[, c(2, 1)]
+specMatched.Down.genes.ENSG.df$L1 = factor(specMatched.Down.genes.ENSG.df$L1, names(Down.genes))
+specMatched.Down.genes.ENSG.df = specMatched.Down.genes.ENSG.df[order(specMatched.Down.genes.ENSG.df$L1), ]
+write.table(specMatched.Down.genes.ENSG.df, file.path(MAGMA.path, "genesets", "specMatched.Down.genes.ENSG.tsv"), sep = "\t", col.names = F, row.names = F, quote = F)
+
+
+specMatched.UpAndDown.genes.ENSG.df = rbind(specMatched.Up.genes.ENSG.df, specMatched.Down.genes.ENSG.df)
+specMatched.UpAndDown.genes.ENSG.df$L1 = factor(specMatched.UpAndDown.genes.ENSG.df$L1, names(Up.genes))
+specMatched.UpAndDown.genes.ENSG.df = specMatched.UpAndDown.genes.ENSG.df[order(specMatched.UpAndDown.genes.ENSG.df$L1), ]
+
+write.table(specMatched.UpAndDown.genes.ENSG.df, file.path(MAGMA.path, "genesets", "specMatched.DE_genes_ENSG_final.tsv"), sep = "\t", col.names = F, row.names = F, quote = F)
+
+
+```

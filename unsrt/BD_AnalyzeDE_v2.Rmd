@@ -1,0 +1,630 @@
+---
+title: "Perform DE analysis"
+subtitle: "Step 1: Compute pseudobulk (PB) profiles"
+author: "Shahin Mohammadi"
+date: "Run on `r Sys.time()`"
+documentclass: article
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r include=FALSE}
+devtools::load_all("~/ACTIONet/")
+
+tables.path = "~/BD/results/tables/"
+figures.path = "~/BD/results/figures/"
+dataset.path = "~/BD/results/datasets/"
+
+```
+
+```{r}
+storeDataset = function( obj, name, description = NULL, dataset.path = "results/datasets"){
+  file_name = paste0(name, ".rds")
+  file_path = file.path(dataset.path, file_name)
+  readr::write_rds( obj, file=file_path)
+  
+  # Syn.datasets <- synStore(Syn.datasets)
+  # folder = Syn.datasets$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }	
+  # OBJ = File(file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )	
+}
+
+storeTable = function( DFs, name, description = NULL, tables.path = "results/tables"){
+  if(is.null(names(DFs))) {
+    names(DFs) = paste("Table", 1:length(DFs), sep = "")
+  }
+  wb <- openxlsx::createWorkbook()
+  for(i in 1:length(DFs)) {
+    n = names(DFs)[[i]] 
+    openxlsx::addWorksheet(wb=wb, sheetName = n)
+    openxlsx::writeData(wb, sheet = n, DFs[[i]]) 
+  }
+  file_name = paste0(name, ".xlsx")
+  file_path = file.path(tables.path, file_name)
+  openxlsx::saveWorkbook(wb, file_path, overwrite = TRUE)
+  
+  # Syn.tables <- synStore(Syn.tables)
+  # folder = Syn.tables$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }
+  # OBJ = File(path = file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )	
+}
+
+
+# Store figure
+storeFigure = function( gg, name, extension, description = NULL, width = 10, height = 8, figures.path = "results/figures"){
+  if(extension == "png") {
+    file_name = paste0(name, ".png")
+    file_path = file.path(figures.path, file_name)
+    png(file_path, width = width, height = height, units = "in", res = 300)
+  } else if(extension == "pdf") {
+    file_name = paste0(name, ".pdf")
+    file_path = file.path(figures.path, file_name)
+    pdf(file_path, width = width, height = height)
+  }
+  print(gg)
+  dev.off()
+  
+  # Syn.figures <- synStore(Syn.figures)
+  # folder = Syn.figures$properties$id
+  # if(is.null(description)) {
+  #   description = file_name
+  # }  
+  # OBJ = File(path = file_path, name = description, parentId = folder)
+  # 
+  # suppressWarnings( {suppressMessages( {out = synStore(OBJ)} )} )
+}
+```
+
+
+# Setup environment
+```{r}
+pb.sce = readr::read_rds("~/BD/results/datasets/BD_pseudobulk_profiles.rds")
+
+cols= readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+```
+
+
+# Prefilter outlier samples using % of excitatory neurons
+SZ33 is removed due to having > 80% ExNeu, and samples SZ3, SZ15, SZ24, SZ29 are removed due to having less than 10% ExNeu
+```{r}
+ncells = t(do.call(rbind, pb.sce@int_colData$n_cells))
+
+cs = Matrix::colSums(ncells)
+ncells.freq = 100*scale(ncells, center = F, scale = cs)
+Ex.perc = (fast_column_sums(ncells.freq[grepl("^Ex", rownames(ncells.freq)) & !grepl("^Ex-NRGN", rownames(ncells.freq)), ]))
+
+mask = (Ex.perc >= 10) & (Ex.perc <= 80) 
+pb.sce.filtered = pb.sce[, mask]
+
+```
+
+
+
+```{r}
+df.DE = readr::read_rds("~/BD/results/datasets/allDE_PB_final.rds")
+
+DE.tables = df.DE$table[1:2]
+
+```
+
+
+
+```{r}
+
+library(qvalue)
+set.seed(0)
+Pi1s = sapply(1:length(DE.tables), function(i) {
+  DFs = DE.tables[[i]]
+  Pi1 = sapply(DFs, function(df) {
+    pi1 = 1- qvalue(df$p_val)$pi0
+  })
+})
+
+
+Gene.counts = sapply(1:length(DE.tables), function(i) {
+  DFs = DE.tables[[i]]
+  gc = sapply(DFs, function(df) {
+   length(df$gene[ (df$p_adj.loc < 0.05) & (abs(df$logFC) > 0.1)])
+  })
+})
+
+X = Gene.counts
+# 
+# p = df$p_val
+# pi1 = 1- qvalue(p)$pi0
+# qobj2 <- qvalue(p, lambda=0.5, pfdr=TRUE)
+# qobj3 <- qvalue(p, fdr.level=0.05, pi0.method="bootstrap", adj=1.2)
+
+
+colnames(Pi1s) = names(DE.tables)
+
+Pi1s = as.data.frame(Pi1s)
+Pi1s = cbind(data.frame(Celltype = rownames(Pi1s)), Pi1s)
+storeTable(list(Pi1 = Pi1s), name = "Pi1_final", tables.path = tables.path)
+
+
+X = as.matrix(Pi1s[, -1])
+Y = as.matrix(Gene.counts)
+# X = as.matrix(Pi1s[, -c(1, 4)])
+perm = order(Y[, 1], decreasing = T)
+X = X[perm , ]
+X[X < 0.05] = 0
+Y = Y[perm, ]
+require(ComplexHeatmap)
+Cpal = viridis::magma(11)#circlize::colorRamp2(seq(0, 0.5, length.out = 10), c("white", pals::brewer.purples(9)))
+ht = Heatmap(X, cluster_rows = F, cluster_columns = F, row_names_gp = gpar(col = cols[rownames(X)]), rect_gp = gpar(col = "darkgrey"), row_names_side = "left", name = "Pi1", col = Cpal) + Heatmap(Y, cluster_rows = F, cluster_columns = F, row_names_gp = gpar(col = cols[rownames(X)]), rect_gp = gpar(col = "darkgrey"), row_names_side = "left", name = "# genes", col = Cpal)
+  
+
+Gene.counts
+
+
+Y = apply
+
+print(ht)
+# storeFigure(ht, "Pi1_heatmap_final", extension = "pdf", height = 6, width = 2.75, figures.path = figures.path)
+
+```
+
+```{r}
+Syngo = openxlsx::read.xlsx("~/syngo_annotations_v2.xlsx")
+
+SynGO.Pathways = split(Syngo$human.ortholog.gene.symbol, Syngo$GO.term.name)
+readr::write_rds(SynGO.Pathways, "~/BD/results/datasets/SynGO.rds")
+
+
+# i = 1
+# DFs = DE.tables[[i]]
+
+common.genes = rownames(pb.sce.filtered)
+Syngo.df = as.data.frame(do.call(cbind, lapply(SynGO.Pathways, function(gs) as.numeric(common.genes %in% gs))))
+rownames(Syngo.df) = rownames(pb.sce.filtered)
+readr::write_rds(Syngo.df, "~/BD/results/datasets/SynGO_DF.rds")
+
+```
+
+```{r}
+require(fgsea)
+SynGO.Pathways = readr::read_rds("~/BD/results/datasets/SynGO.rds")
+SynGO.Pathways = SynGO.Pathways[sapply(SynGO.Pathways, length) >=5]
+
+for(i in 1:length(DE.tables)) {
+  DFs = DE.tables[[i]]
+  cts = setdiff(names(DFs), c("Ex-NRGN"))
+  cts = cts[grep("^Ex|^In", cts)]
+  
+  enrichments = vector("list", length(cts))
+  names(enrichments) = cts
+  for(k in 1:length(cts)) {
+    print(cts[[k]])
+    res_DE = DFs[[cts[[k]]]]  
+    
+    x = res_DE[grep("^RPS|^RPL", res_DE$gene), ]
+    
+    v <- -log10(res_DE$p_adj.loc)*(sign(res_DE$logFC)) #$t
+    names(v) = res_DE$gene
+    
+    set.seed(0)
+    enrich = fgsea(SynGO.Pathways, v, eps = 1e-300, nPerm = 10000)
+    enrich = enrich[order(enrich$pval, decreasing = F), ]
+    enrichments[[k]] = enrich
+    
+  }
+  
+  storeTable(enrichments, sprintf("SynGO_fgsea_%s_final", names(DE.tables)[[i]]), tables.path = tables.path)
+  
+  logPvals = -log10(do.call(cbind, lapply(enrichments, function(enrich) enrich$padj[match(names(SynGO.Pathways), enrich$pathway)])))
+  rownames(logPvals) = names(SynGO.Pathways)
+  logPvals[logPvals < -log10(0.05)] = 0
+  logPvals = logPvals[fast_row_max(logPvals) > -log10(0.05), ]
+  ht = Heatmap(logPvals, name = "Enrichment", col = blues9, show_row_dend = F, show_column_dend = F, rect_gp = gpar(col = "black"), row_names_side = "left", row_names_max_width = unit(100, "cm"), column_names_gp = gpar(col = cols[colnames(logPvals)]), cluster_columns = F)
+  storeFigure(ht, sprintf("SynGO_fgsea_%s_final", names(DE.tables)[[i]]), extension = "pdf", figures.path = figures.path, width = 14)
+}
+
+```
+
+```{r}
+data("gProfilerDB_human")
+REAC.Pathways = gProfilerDB_human$SYMBOL$REAC
+REAC.Pathways = apply(REAC.Pathways, 2, function(x) rownames(REAC.Pathways)[x > 0])
+l = sapply(REAC.Pathways, length)
+REAC.Pathways = REAC.Pathways[(l >= 10) & (l <= 500)]
+
+for(i in 2:length(DE.tables)) {
+  DFs = DE.tables[[i]]
+  cts = setdiff(names(DFs), c("Ex-NRGN"))
+  cts = cts[grep("^Ex|^In", cts)]
+  
+  enrichments = vector("list", length(cts))
+  names(enrichments) = cts
+  for(k in 1:length(cts)) {
+    print(cts[[k]])
+    res_DE = DFs[[cts[[k]]]]  
+    
+    v <- res_DE$t
+    names(v) = res_DE$gene
+    
+    set.seed(0)
+    enrich = fgsea(REAC.Pathways, v, eps = 1e-300, nPerm = 10000)
+    enrich = enrich[order(enrich$pval, decreasing = F), ]
+    enrichments[[k]] = enrich
+    
+  }
+  
+  storeTable(enrichments, sprintf("REAC_fgsea_%s", names(DE.tables)[[i]]), tables.path = tables.path)
+  
+  logPvals = -log10(do.call(cbind, lapply(enrichments, function(enrich) enrich$padj[match(names(REAC.Pathways), enrich$pathway)])))
+  rownames(logPvals) = names(REAC.Pathways)
+  logPvals[logPvals < -log10(0.05)] = 0
+  logPvals = logPvals[fast_row_max(logPvals) > -log10(1e-10), ]
+  # ht = plot.top.k.features(logPvals)
+  ht = Heatmap(logPvals, name = "Enrichment", col = blues9, show_row_dend = F, show_column_dend = F, rect_gp = gpar(col = "black"), row_names_side = "left", row_names_max_width = unit(100, "cm"), column_names_gp = gpar(col = cols[colnames(logPvals)]), cluster_columns = F)
+  storeFigure(ht, sprintf("REAC_fgsea_%s", names(DE.tables)[[i]]), extension = "pdf", figures.path = figures.path, width = 14)
+}
+```
+
+```{r}
+data("gProfilerDB_human")
+BP.Pathways = gProfilerDB_human$SYMBOL$`GO:BP`
+BP.Pathways = apply(BP.Pathways, 2, function(x) rownames(BP.Pathways)[x > 0])
+l = sapply(BP.Pathways, length)
+BP.Pathways = BP.Pathways[(l >= 10) & (l <= 500)]
+
+for(i in 1:length(DE.tables)) {
+  DFs = DE.tables[[i]]
+  cts = setdiff(names(DFs), c("Ex-NRGN"))
+  cts = cts[grep("^Ex|^In", cts)]
+  
+  enrichments = vector("list", length(cts))
+  names(enrichments) = cts
+  for(k in 1:length(cts)) {
+    print(cts[[k]])
+    res_DE = DFs[[cts[[k]]]]  
+    
+    v <- res_DE$t
+    names(v) = res_DE$gene
+    
+    set.seed(0)
+    enrich = fgsea(BP.Pathways, v, eps = 1e-300, nPerm = 10000)
+    enrich = enrich[order(enrich$pval, decreasing = F), ]
+    enrichments[[k]] = enrich
+    
+  }
+  
+  storeTable(enrichments, sprintf("BP_fgsea_%s", names(DE.tables)[[i]]), tables.path = tables.path)
+  
+  logPvals = -log10(do.call(cbind, lapply(enrichments, function(enrich) enrich$padj[match(names(BP.Pathways), enrich$pathway)])))
+  rownames(logPvals) = names(BP.Pathways)
+  logPvals = logPvals[fast_row_max(logPvals) > -log10(1e-10), ]
+  # ht = plot.top.k.features(logPvals)
+  ht = Heatmap(logPvals, name = "Enrichment", col = blues9, show_row_dend = F, show_column_dend = F, rect_gp = gpar(col = "black"), row_names_side = "left", row_names_max_width = unit(100, "cm"), column_names_gp = gpar(col = cols[colnames(logPvals)]), cluster_columns = F)
+  storeFigure(ht, sprintf("BP_fgsea_%s", names(DE.tables)[[i]]), extension = "pdf", figures.path = figures.path, width = 14)
+}
+```
+
+
+
+```{r}
+# DE.tables = df.DE$table[c(1:2)]
+
+scores = vector("list", length(DE.tables))
+names(scores) = names(DE.tables)
+for(i in 1:length(DE.tables)) {
+  DFs = DE.tables[[i]]
+  cts = setdiff(names(DFs), c("Ex-NRGN"))
+  cts = cts[grep("^Ex|^In", cts)]
+  
+  # common.genes = sort(unique(Reduce("intersect", lapply(DFs, function(df) df$gene))))
+  # ll = lapply(1:length(cts), function(k) {
+  #   df = DFs[[cts[[k]]]]
+  #   
+  #   # v = -log(df$p_val[match(common.genes, df$gene)])
+  #   # v[abs(df$logFC[match(common.genes, df$gene)]) < logFC_threshold] = 0
+  #   
+  #   
+  #   v = abs(df$t[match(common.genes, df$gene)])
+  #   
+  #   # v = abs(df$t[match(common.genes, df$gene)])
+  #   # v[scale(df$AveExpr[match(common.genes, df$gene)]) < -1] = 0
+  #   return(v)
+  # })
+  # X = do.call(cbind, ll)
+  # colnames(X) = cts #paste(names(DE.tables)[[i]], cts, sep = ":")
+  # rownames(X) = common.genes
+  # 
+  common.genes = unique(Reduce("intersect", lapply(DFs[cts], function(x) x$gene)))
+  X = do.call(cbind, lapply(DFs[cts], function(DF) {
+    v = abs(DF$t[match(common.genes, DF$gene)])
+    # v = -log10(DF$p_val[match(common.genes, DF$gene)])
+    # v[abs(DF$logFC[match(common.genes, DF$gene)]) < logFC_threshold] = 0
+    return(v)    
+  }))
+  rownames(X) = common.genes  
+  
+
+  # X = (rowData(pb.sce.filtered)$capture.rate[rownames(X), cts] >= 0.1) * X
+  
+  scores[[i]] = X
+}
+
+
+# all.scores = do.call(cbind, scores)
+# 
+# storeDataset(all.scores, "All_abs_tstats_all_traits", dataset.path = dataset.path)
+# 
+# 
+# CC = cor(do.call(cbind, scores[c(1, 4)]))
+# require(seriation)
+# perm = get_order(seriate(as.dist(1-CC), "OLO"))
+# diag(CC) = NA
+# ht = Heatmap(CC[perm, perm], cluster_rows = F, cluster_columns = F, name = "Correlation", rect_gp = gpar(col = "black"), row_names_side = "left")
+# 
+# storeFigure(ht, "Cross_celltypes_and_traits_correlations_logFC_masked", extension = "pdf", figures.path = figures.path, width = 14, height = 12)
+
+require(org.Hs.eg.db)
+
+suppressWarnings(ids <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = rownames(scores[[1]]), keytype = "SYMBOL", column = "ENSEMBL", multiVals = "first"))
+ids[is.na(ids)] = ""
+
+df = cbind(data.frame(Genes = ids), as.data.frame(scores$BD))
+df = df[ids != "", ]
+df = df[match(sort(unique(df$Genes)), df$Genes), ]
+
+readr::write_tsv(df, "~/BD/results/tables/tstats_BD.tsv")
+
+suppressWarnings(ids <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = rownames(scores[[2]]), keytype = "SYMBOL", column = "ENSEMBL", multiVals = "first"))
+ids[is.na(ids)] = ""
+
+df = cbind(data.frame(Genes = ids), as.data.frame(scores$SZ))
+df = df[ids != "", ]
+df = df[match(sort(unique(df$Genes)), df$Genes), ]
+
+readr::write_tsv(df, "~/BD/results/tables/tstats_SZ.tsv")
+
+
+```
+
+
+
+```{r}
+require(stringr)
+
+MAGMA.path = "~/magma/"
+dl = list.dirs(file.path(MAGMA.path, "psych_arch/"), full.names = F, recursive = F)
+
+HMAGMA.Pvals = vector("list", 1)
+names(HMAGMA.Pvals) = c("UpAndDown")
+ll = lapply(dl, function(cond) {
+  print(cond)
+  file.name = sprintf("%s/SZ/%s_UpAndDown.gsa.out", MAGMA.path, cond)
+  lines = readLines(con <- file(file.name))
+  lines = str_split(lines, "\n")[-c(1:5)]
+  
+  pvals = sapply(lines, function(ll) {
+    parts = str_split(ll, " ")
+    as.numeric(parts[[1]][length(parts[[1]])])
+  })
+  
+  names(pvals) = sapply(lines, function(ll) {
+    parts = str_split(ll, " ")
+    parts[[1]][[1]]
+  })
+  
+  return(pvals)
+})
+names(ll) = dl
+
+Pvals = do.call(cbind, ll)
+# selected.traits = c("hmagmaAdultBrain__bip2", "hmagmaAdultBrain__sz3", "hmagmaAdultBrain__asd", "hmagmaAdultBrain__alz2noapoe")
+# Pvals = Pvals[, selected.traits]
+# trait.labels = c("Bipolar (BD)", "Schizophrenia (SZ)", "Autism (ASD)", "Alzheimer (AD)")
+# colnames(Pvals) = trait.labels
+# rownames(Pvals) = sapply(rownames(Pvals), function(str) str_split(str, ":")[[1]][[2]])
+
+# Pvals.corr = matrix(FDRestimation::p.fdr(Pvals)$fdrs, nrow = nrow(Pvals))
+# rownames(Pvals.corr) = rownames(Pvals)
+# colnames(Pvals.corr) = colnames(Pvals)
+# Pvals = Pvals.corr
+
+
+df = as.data.frame(Pvals)
+
+X = -log10(Pvals)
+# X[X < -log10(0.1)]= 0
+ht = Heatmap(X, col = blues9, rect_gp = gpar(col = "black"), show_row_dend = F, show_column_dend = F, name = "Enrichment", row_names_side = "left", column_names_max_height = unit(100, "cm"), row_names_gp = gpar(col = cols[rownames(X)]), cluster_rows = T)
+
+print(ht)
+# storeFigure(ht, "HMAGMA_SZ", extension = "pdf", figures.path = figures.path, width = 5, height = 8)
+# readr::write_rds(HMAGMA.Pvals, file.path(results.path, "HMAGMA_results_raw.rds"))
+
+Pvals.SZ = Pvals
+
+```
+```{r}
+Pvals = list(BD = Pvals.BD, SZ = Pvals.SZ)
+storeTable(Pvals, name = "HMAGMA", tables.path = tables.path)
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+Syngo.df = readr::read_rds("~/BD/results/datasets/SynGO_DF.rds")
+Syngo.df = Syngo.df[intersect(rownames(pb.sce.filtered), rownames(Syngo.df)), ]
+Syngo.df = Syngo.df[fast_column_sums(as.matrix(Syngo.df)) >= 5]
+
+DFs = DE.tables$BD
+cts = setdiff(names(DFs), c("Ex-NRGN"))
+cts = cts[grep("^Ex|^In", cts)]
+
+
+require(iDEA)
+ideas = vector("list", length(cts))
+names(ideas) = cts
+for(k in 1:length(cts)) {
+	print(cts[[k]])
+	
+  res_DE = DFs[[cts[[k]]]]  
+  
+  pvalue <- res_DE$p_val
+  zscore <- qnorm(pvalue/2.0, lower.tail=FALSE) #### convert the pvalue to z-score
+  beta <- res_DE$logFC ## effect size
+  se_beta <- abs(beta/zscore) ## to approximate the standard error of beta
+  beta_var = se_beta^2  ### square 
+  summary_data = data.frame(beta = beta,beta_var = beta_var)
+  rownames(summary_data) = res_DE$gene
+  
+  idea <- CreateiDEAObject(summary_data, Syngo.df, max_var_beta = 100, min_precent_annot = 1/nrow(Syngo.df), num_core=42)
+  
+  system.time( {idea <- iDEA.fit(idea,
+                   fit_noGS=FALSE,
+  	         init_beta=NULL, 
+  	         init_tau=c(-2,0.5),
+  	         min_degene=5,
+  	         em_iter=15,
+  	         mcmc_iter=1000, 
+  	         fit.tol=1e-5,
+                   modelVariant = F,
+  	         verbose=TRUE)} )
+
+  # Correct p-values
+  idea <- iDEA.louis(idea)
+  
+  # # Get results  
+  # head(idea@gsea)
+  # 
+
+  idea <- iDEA.BMA(idea)
+  # head(idea@BMA_pip)
+  
+  ideas[[k]] = idea
+}
+
+readr::write_rds(ideas, "BD_iDEA.rds")
+
+
+
+
+```
+
+```{r}
+ideas= readr::read_rds("~/BD_iDEA.rds")
+
+idea = ideas$`In-SST`
+gsea = idea@gsea
+
+
+```
+
+```{r}
+DE.old = readr::read_rds("~/results/datasets/Cohort_specific_DE_results.rds")
+
+SZ.old = DE.old$McLean$table$PhenotypeSZ
+SZ.new = DE.tables$PhenotypeSZ
+cts = intersect(names(SZ.old), names(SZ.new))
+CC = sapply(cts, function(ct) {
+  df.old = SZ.old[[ct]]
+  df.new = SZ.new[[ct]]
+  
+  common.genes = sort(intersect(df.old$gene, df.new$gene))
+  cc = cor(df.old$t[match(common.genes, df.old$gene)], df.new$t[match(common.genes, df.new$gene)])
+  
+  return(cc)
+})
+
+
+```
+
+
+```{r}
+for(ds in 1:length(resDE)) {
+  print(names(resDE)[[ds]])
+  
+  DE.tbls = resDE[[ds]]$table[[1]]
+  
+  Up.DFs = lapply(1:length(DE.tbls), function(i) {
+    res = DE.tbls[[i]]
+    res = res[res$logFC > logFC_threshold, ]
+    res = res[order(res$t, decreasing = T), ]
+    return(res)  
+  })
+  
+  names(Up.DFs) = names(DE.tbls)
+  storeTable(Up.DFs, name = sprintf("DE_genes_up_%s_logFC_filtered", names(resDE)[[ds]]), tables.path = tables.path)
+
+  Down.DFs = lapply(1:length(DE.tbls), function(i) {
+    res = DE.tbls[[i]]
+    res = res[res$logFC < -logFC_threshold, ]
+    res = res[order(res$t, decreasing = F), ]
+  })
+  names(Down.DFs) = names(DE.tbls)
+  storeTable(Down.DFs, name = sprintf("DE_genes_down_%s_logFC_filtered", names(resDE)[[ds]]), tables.path = tables.path)
+}
+
+```
+```{r}
+
+  DE.tbls = resDE[[1]]$table[[1]]
+  DE.tbls = DE.tbls[-c(1, 26, 27)]
+  pval_threshold = 0.1
+  logFC_threshold = 0.1
+  
+  Up.DFs = lapply(1:length(DE.tbls), function(i) {
+    res = DE.tbls[[i]]
+
+    # res = res[scale(X$AveExpr) > 0, ]
+    # res$fdr = p.adjust(res$p_val, method = "fdr")
+    res$fdr = res$p_adj.glb
+    
+    mask = (res$logFC > logFC_threshold) & (res$fdr < pval_threshold)
+    mask[is.na(mask)] = F
+    res = res[mask, ]
+    res = res[order(res$t, decreasing = F), ]
+    
+    return(res)  
+  })
+  
+  names(Up.DFs) = names(DE.tbls)
+  Down.DFs = lapply(1:length(DE.tbls), function(i) {
+    res = DE.tbls[[i]]
+
+    # res = res[scale(X$AveExpr) > 0, ]
+    # res$fdr = p.adjust(res$p_val, method = "fdr")
+    # 
+    res$fdr = res$p_adj.glb
+    
+    mask = (res$logFC < -logFC_threshold) & (res$fdr < pval_threshold)
+    mask[is.na(mask)] = F
+    res = res[mask, ]
+    res = res[order(res$t, decreasing = F), ]
+    
+    return(res)
+  })
+  names(Down.DFs) = names(DE.tbls)
+  
+  
+  t(sapply(Up.DFs, dim))
+  
+  
+  t(sapply(Down.DFs, dim))
+  
+  
+  # sapply(DE.tbls, function(res) sum(res$p_val < 0.05))
+  
+  
+```
+

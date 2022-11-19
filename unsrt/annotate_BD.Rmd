@@ -1,0 +1,376 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+devtools::load_all("~/ACTIONet/")
+
+```
+
+```{r}
+BP.ace = AnnData2ACE("~/Ruzika_doublet_removed_BP_counts.h5ad")
+SZ.ace = readr::read_rds("~/results/datasets/combinedCells_ACTIONet.rds")
+
+```
+
+
+
+```{r}
+assays(SZ.ace) = assays(SZ.ace)[1]
+
+ace1 = SZ.ace[, SZ.ace$Cohort == "McLean"]
+ace2 = BP.ace
+
+common.cols = intersect(colnames(colData(ace1)), colnames(colData(ace2)))
+colData(ace1) = colData(ace1)[, common.cols]
+colData(ace2) = colData(ace2)[, common.cols]
+
+
+common.genes = sort(unique(intersect(rownames(ace1), rownames(ace2))))
+ace1 = ace1[common.genes, ]
+ace2 = ace2[common.genes, ]
+rownames(ace1) = rownames(ace2) = common.genes
+
+out = list(SZ = ace1, BD = ace2)
+readr::write_rds(out, "~/BD/aces.rds")
+
+
+```
+
+
+```{r}
+combined.ace = cbind(ace1, ace2)
+
+```
+
+```{r}
+
+combined.ace$Celltype = NA
+combined.ace$Celltype[1:ncol(ace1)] = as.character(SZ.ace$Celltype[SZ.ace$Cohort == "McLean"])
+
+
+require(stringr)
+nb = sapply(combined.ace$Batch[1:ncol(ace1)], function(str) str_split(str, "_")[[1]][[2]])
+combined.ace$Batch[1:ncol(ace1)] = nb
+combined.ace$Batch = droplevels(combined.ace$Batch)
+
+nh = sapply(combined.ace$HTO[1:ncol(ace1)], function(str) str_split(str, "_")[[1]][[2]])
+combined.ace$HTO[1:ncol(ace1)] = nh
+combined.ace$HTO = droplevels(combined.ace$HTO)
+
+readr::write_rds(combined.ace, "~/BD/combined_ace.rds")
+
+
+```
+
+
+```{r}
+combined.ace = normalize.ace(combined.ace)
+combined.ace = reduce.ace(combined.ace)
+combined.ace = run.ACTIONet(combined.ace)
+
+readr::write_rds(combined.ace, "~/BD/ACTIONet_v1.rds")
+
+```
+
+```{r}
+combined.ace = readr::read_rds("~/BD/ACTIONet_v1.rds")
+
+cols= readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+  
+
+
+```
+
+```{r}
+Phenotype = as.character(combined.ace$Phenotype)
+Phenotype[Phenotype == "0"] = "BD"
+Phenotype = factor(Phenotype, c("CON", "SZ", "BD"))
+combined.ace$Phenotype = Phenotype
+
+```
+
+```{r}
+Labels = names(cols)[combined.ace$Celltype]
+Labels = factor(Labels, names(cols))
+
+combined.ace$Celltype = Labels
+
+```
+
+```{r}
+# plot.ACTIONet.gradient(combined.ace, exp(-scale(combined.ace$node_centrality)), alpha_val = 0)
+
+# plot(density(exp(-scale(combined.ace$node_centrality))))
+
+mask = (exp(-scale(combined.ace$node_centrality)) > 5) # & (combined.ace$Phenotype == "BD")
+sum(!mask)
+
+plot(combined.ace, as.numeric(mask))
+
+
+```
+
+```{r}
+ace = combined.ace[, !mask]
+
+```
+
+```{r}
+plot(ace, ace$Celltype)
+
+```
+```{r}
+L = as.character(ace$Celltype)
+L[is.na(L)] = "-"
+design = do.call(cbind, lapply(levels(ace$Celltype), function(celltype) as.numeric( L == celltype, na.rm = T)))
+colnames(design) = levels(ace$Celltype)
+design = as(design, "sparseMatrix")
+
+system.time( {X = ace$ACTIONet %*% design} )
+X2 = X %*% Diagonal(n = ncol(design), 1 / fast_column_sums(design))
+dim(X2) 
+L2 = levels(ace$Celltype)[apply(X, 1, which.max)]
+
+L3 = L
+L3[is.na(ace$Celltype)] = L2[is.na(ace$Celltype)]
+plot.ACTIONet(ace, L2)
+plot.ACTIONet(ace, L3)
+
+ace$Celltype_inferred = factor(L3, levels(ace$Celltype))
+
+```
+
+
+```{r}
+readr::write_rds(ace, "~/BD/ACTIONet_v2.rds")
+                 
+```
+
+```{r}
+ace = readr::read_rds("~/BD/ACTIONet_v2.rds")
+
+cols= readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+```
+
+
+
+```{r}
+  archetype_footprint = t(colMaps(ace)$archetype_footprint)
+  S = logcounts(ace)
+  specificity.out <- compute_archetype_feature_specificity(S, archetype_footprint)
+  
+  X = specificity.out$upper_significance
+  rownames(X) = rownames(ace)
+  BD.arch.annot3 = annotate.profile.using.markers(t(X), markers)
+  
+  rownames(BD.arch.annot3$Enrichment) = paste("A", 1:length(BD.arch.annot3$Label), ": ", BD.arch.annot3$Label, sep = "")
+  Heatmap(BD.arch.annot3$Enrichment)
+  
+  rownames(SZ.arch.annot$Enrichment) = paste("A", 1:length(SZ.arch.annot$Label), ": ", SZ.arch.annot$Label, sep = "")
+  Heatmap(SZ.arch.annot$Enrichment)
+  
+  rownames(BD.arch.annot$Enrichment) = paste("A", 1:length(BD.arch.annot$Label), ": ", BD.arch.annot$Label, sep = "")
+  Heatmap(BD.arch.annot$Enrichment)
+  
+
+  
+```
+
+```{r}
+# celltypes = readr::read_rds("~/results/datasets/celltype_gene_specificity.rds")
+# markers = apply(celltypes, 2, function(x) rownames(celltypes)[scale(x) > 3])
+# BD.arch.annot2 = annotate.archetypes.using.markers(ace, markers)
+# SZ.arch.annot2 = annotate.archetypes.using.markers(SZ.ace, markers)
+
+# SZ.archs = readr::read_rds("~/results/datasets/archetype_gene_specificity.rds")
+SZ.archs = SZ.ace$unified_feature_specificity
+BD.archs = rowMaps(ace)$unified_feature_specificity
+
+common.genes = intersect(rownames(SZ.archs), rownames(ace))
+
+BD.arch.annot = annotate.archetypes.using.labels(ace, ace$Celltype_inferred)
+SZ.arch.annot = annotate.archetypes.using.labels(SZ.ace, SZ.ace$Celltype)
+
+
+CC = cor(SZ.archs[common.genes, ], BD.archs[common.genes, ])
+
+out = list(SZ.archs = SZ.archs[common.genes, ], BD.archs = BD.archs[common.genes, ], SZ.arch.annotations = SZ.arch.annot, BD.arch.annotations = BD.arch.annot, Sim = CC)
+readr::write_rds(out, "~/BD/archetype_mapping_to_SZ.rds")
+
+```
+
+```{r}
+arch.mapping = readr::read_rds("~/BD/archetype_mapping_to_SZ.rds")
+
+```
+
+```{r}
+W1 = arch.mapping$SZ.arch.annotations$Enrichment
+W1[W1 < 0] = 0
+W1 = log1p(W1)
+W1 = W1 / max(W1)
+# W1 = doubleNorm(W1)
+
+
+W2 = arch.mapping$BD.arch.annotations$Enrichment
+W2[W2 < 0] = 0
+W2 = log1p(W2)
+# W2 = doubleNorm(W2)
+W2 = W2 / max(W2)
+
+X = W1 %*% t(W2)
+```
+
+```{r}
+X = exp(cor(arch.mapping$SZ.archs, arch.mapping$BD.archs, method = "spearman"))
+
+```
+
+```{r}
+celltypes = readr::read_rds("~/results/datasets/celltype_gene_specificity.rds")
+markers = apply(celltypes, 2, function(x) rownames(celltypes)[scale(x) > 3])
+BD.arch.annot2 = annotate.profile.using.markers(t(arch.mapping$BD.archs), markers)
+SZ.arch.annot2 = annotate.profile.using.markers(t(arch.mapping$SZ.archs), markers)
+
+W1 = SZ.arch.annot2$Enrichment
+W1[W1 < 0] = 0
+W1 = W1 / max(W1)
+
+W2 = BD.arch.annot2$Enrichment
+W2[W2 < 0] = 0
+W2 = W2 / max(W2)
+X = W1 %*% t(W2)
+
+
+df = data.frame(BD.arch.annot2$Label, arch.mapping$BD.arch.annotations$Label)
+
+Heatmap(BD.arch.annot2$Enrichment) + Heatmap(arch.mapping$BD.arch.annotations$Enrichment)
+
+
+```
+```{r}
+dd = model.matrix(~ 0. + ace$Celltype_inferred)
+colnames(dd) = levels(ace$Celltype_inferred)
+
+S = logcounts(ace)
+ct.specificity.out <- compute_archetype_feature_specificity(S, t(dd))
+
+ct.spec = ct.specificity.out$upper_significance
+row.names(ct.spec) = rownames(ace)
+colnames(ct.spec) = colnames(dd)
+
+cg = intersect(rownames(ct.spec), rownames(celltypes))
+cc = cor(ct.spec[cg, ], celltypes[cg, ])
+
+Heatmap(cc, cluster_rows = F, cluster_columns = F)
+
+
+X1 = arch.mapping$SZ.archs
+colnames(X1) = arch.mapping$SZ.arch.annotations$Label
+
+X2 = arch.mapping$BD.archs
+colnames(X2) = arch.mapping$BD.arch.annotations$Label
+
+```
+
+```{r}
+X = cor(arch.mapping$SZ.archs, arch.mapping$BD.archs)
+rownames(X) = paste("A", 1:length(arch.mapping$SZ.arch.annotations$Label), ": ", arch.mapping$SZ.arch.annotations$Label, sep = "")
+colnames(X) = paste("A", 1:length(arch.mapping$BD.arch.annotations$Label), ": ", arch.mapping$BD.arch.annotations$Label, sep = "")
+
+# W = exp(X)
+# M = as(MWM_hungarian(W), "dgTMatrix")
+# row.perm = M@i+1
+# col.perm = M@j+1
+
+# X.permuted = X[M@i+1, M@j+1]
+
+row.perm = order(match(arch.mapping$SZ.arch.annotations$Label, levels(ace$Celltype)))
+row.perm = c(setdiff(row.perm, c(7, 11, 17, 29)), c(7, 11, 17, 29))
+col.perm = order(match(arch.mapping$BD.arch.annotations$Label, levels(ace$Celltype)))
+
+X.permuted = X[row.perm, col.perm]
+
+ht = Heatmap(X.permuted^2, cluster_rows = F, cluster_columns = F, rect_gp = gpar(col = "black"), row_names_side = "left", name = "Correlation^2", row_title = "SZ+CON", column_title = "SZ+BD+CON", col = blues9, column_names_gp = gpar(col = cols[arch.mapping$BD.arch.annotations$Label[col.perm]]), row_names_gp = gpar(col = cols[arch.mapping$SZ.arch.annotations$Label[row.perm]]))
+
+
+
+
+pdf("~/BD/archetype_mapping_to_SZ_heatmap.pdf", width = 8, height = 7)
+print(ht)
+dev.off()
+
+
+```
+
+
+
+```{r}
+plot.ACTIONet(ace, label_attr = ace$Celltype_inferred)
+
+plot.ACTIONet(ace, label_attr = ace$Celltype)
+
+```
+
+```{r}
+gg = plot.ACTIONet(ace, label_attr = ace$Celltype_inferred, trans_attr = ace$node_centrality, trans_th = 0, trans_fac = 2, palette = cols)
+
+png("~/BD/ACTIONet_final.png", width = 1600, height = 1200, res = 150)
+print(gg)
+dev.off()
+
+
+gg = plot.ACTIONet(ace, label_attr = ace$Celltype_inferred, trans_attr = ace$node_centrality, trans_th = 0, trans_fac = 2, add_text_labels = F, palette = cols)
+
+png("~/BD/ACTIONet_final_noLabels.png", width = 1600, height = 1200, res = 150)
+print(gg)
+dev.off()
+
+```
+
+```{r}
+gg = plot.ACTIONet(ace, label_attr = ace$Celltype, trans_attr = ace$node_centrality, trans_th = 0, trans_fac = 2, palette = c(cols, "NA" = "#cccccc"))
+
+png("~/BD/ACTIONet_before_inference.png", width = 1600, height = 1200, res = 150)
+print(gg)
+dev.off()
+
+
+gg = plot.ACTIONet(ace, label_attr = ace$Celltype, trans_attr = ace$node_centrality, trans_th = 0, trans_fac = 2, add_text_labels = F, palette = c(cols, "NA" = "#cccccc"))
+
+png("~/BD/ACTIONet_before_inference_noLabels.png", width = 1600, height = 1200, res = 150)
+print(gg)
+dev.off()
+
+```
+
+
+```{r}
+perm = order(match(BD.arch.annot$Label, levels(ace$Celltype)))
+# arch.labels = paste("A", perm, "-", BD.arch.annot$Label[perm], sep = "")
+
+arch.labels = paste("A", 1:length(BD.arch.annot$Label), ": ", BD.arch.annot$Label, sep = "")
+
+
+ggs = plot.ACTIONet.archetype.footprint(ace, arch.labels = arch.labels)
+
+png("~/BD/archetype_footprints.png", width = 4000, height = 4000, res = 300)
+gridExtra::grid.arrange(grobs = ggs[perm], nrow = 5)
+dev.off()
+ 
+# 
+# png("~/BD/archetype_footprints_HQ.png", width = 4000, height = 4000, res = 150)
+# gridExtra::grid.arrange(grobs = ggs, nrow = 5)
+# dev.off()
+
+
+
+```
+
+
+
+

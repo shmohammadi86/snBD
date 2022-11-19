@@ -1,0 +1,148 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+devtools::load_all("~/ACTIONet/")
+
+```
+
+```{r}
+ace = readr::read_rds("~/BD/results/datasets/ACTIONet_v2.rds")
+
+cols= readr::read_rds("~/results/datasets/celltype_colors.rds")
+
+```
+
+
+
+```{r}
+Labels = ace$Celltype_inferred
+IDX.BD = which(ace$Phenotype %in% c("CON", "BD"))
+cols.BD = split(IDX.BD, Labels[IDX.BD])
+
+
+Labels = ace$Celltype_inferred
+IDX.SZ = which(ace$Phenotype %in% c("CON", "SZ"))
+cols.SZ = split(IDX.SZ, Labels[IDX.SZ])
+SZ.subaces = lapply(cols.SZ, function(idx) ace[, idx])
+
+for(i in 1:length(SZ.subaces)) {
+  sub.ace = SZ.subaces[[i]]
+  system.time({ imputed.logcounts = magic(Matrix::t(logcounts(sub.ace))) })
+  assays(sub.ace)$magic = Matrix::t(as.matrix(imputed.logcounts[[1]]))
+  SZ.subaces[[i]] = sub.ace 
+}
+
+```
+
+
+```{r}
+require(stringr)
+meta.tbl = openxlsx::read.xlsx("input/Demographics&Meds_SZ_CON_BD.xlsx")
+meta.tbl$Batch = sapply(meta.tbl$Batch, function(str) str_split(str, "_")[[1]][[2]])
+meta.tbl$HTO = sapply(meta.tbl$HTO, function(str) str_split(str, "_")[[1]][[2]])
+meta.tbl$Individual = paste(meta.tbl$Batch, meta.tbl$HTO, sep = ".")
+
+individual_metadata = meta.tbl
+rownames(individual_metadata) = individual_metadata$Individual
+
+```
+
+
+```{r}
+library(muscat)
+ace$Individual = paste(ace$Batch, ace$HTO, sep = ".")
+
+# sce = as(ace, "SingleCellExperiment")
+sce = revert_ace_as_sce(ace)
+
+sce$cluster_id = ace$Celltype_inferred
+sce$group_id = ace$Phenotype
+sce$sample_id = ace$Individual
+
+# sce.BD = sce[, sce$group_id == "BD"]
+
+library(muscat)
+sce$id <- paste0(sce$group_id, sce$sample_id)
+(sce <- prepSCE(sce,
+    kid = "cluster_id", # subpopulation assignments
+    gid = "group_id",  # group IDs (ctrl/stim)
+    sid = "sample_id",   # sample IDs (ctrl/stim.1234)
+    drop = TRUE))  # drop all other colData columns
+```
+
+```{r}
+bpparam <- MulticoreParam(42, RNGseed = 0)
+
+system.time( {pb.sce <- aggregateData(sce,
+    assay = "logcounts", fun = "mean",
+    by = c("cluster_id", "sample_id"), BPPARAM = bpparam)} )
+
+```
+
+```{r}
+DF = cbind(colData(pb.sce), individual_metadata[colnames(pb.sce), ])[, -1]
+df = as.data.frame(DF)
+
+colData(pb.sce) = DF
+
+```
+
+
+```{r}
+S = counts(ace)
+umis = fast_column_sums(S)
+
+Sb = S
+Sb@x = rep(1, length(Sb@x))
+genes = fast_column_sums(Sb)
+
+umis.per.ind = split(umis, factor(ace$Individual, colnames(pb.sce)))
+genes.per.ind = split(genes, factor(ace$Individual, colnames(pb.sce)))
+
+
+pb.sce$umis = sapply(umis.per.ind, mean)
+pb.sce$genes = sapply(genes.per.ind, mean)
+
+```
+
+```{r}
+IDX = split(1:ncol(ace), ace$Celltype_inferred)
+S = counts(ace)
+S@x = rep(1, length(S@x))
+capture.rate = do.call(cbind, lapply(IDX, function(idx) fastRowMeans(S[, idx])))
+
+rownames(capture.rate) = rownames(ace)
+rowData(pb.sce)$capture.rate = capture.rate
+
+```
+
+```{r}
+
+readr::write_rds(pb.sce, "~/BD/results/datasets/BD_pseudobulk_profiles_Feb2022.rds")
+
+```
+
+
+```{r}
+profiles = do.call(cbind, assays(pb.sce))
+combined.pb = ACTIONetExperiment(assays = list(logcounts = profiles))
+
+combined.pb$Phenotype = rep(pb.sce$Phenotype, length(assays(pb.sce)))
+combined.pb$Celltype = unlist(lapply(names(assays(pb.sce)), function(x) rep(x, ncol(pb.sce))))
+
+
+combined.pb = reduce.ace(combined.pb)
+combined.pb = run.ACTIONet(combined.pb)
+
+gg = plot.ACTIONet(combined.pb, combined.pb$Celltype, palette = cols)
+pdf("~/BD/pseudobulk_profiles_ACTIONet.pdf", width = 8, height = 8)
+print(gg)
+dev.off()
+
+
+```
+
+
